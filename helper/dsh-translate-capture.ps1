@@ -34,7 +34,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '1.2.5'
+$script:ScriptVersion = '1.2.6'
 $script:ThemePath = $ThemePath
 
 # ───────────────────────────── 日志 ─────────────────────────────
@@ -1109,6 +1109,7 @@ $parentCheckedAt = [Environment]::TickCount
 
 try {
     while ($true) {
+      try {
         Complete-Translate
 
         if ($ParentPid -gt 0) {
@@ -1161,6 +1162,11 @@ try {
 
         [System.Windows.Forms.Application]::DoEvents()
         Start-Sleep -Milliseconds $PollMs
+      } catch {
+        # 单次循环里的意外异常不许把整个伴生进程带走（曾经因为一行坏注释而"划词没反应"）
+        Write-Log ('loop error: ' + $_.Exception.Message)
+        Start-Sleep -Milliseconds 500
+      }
     }
 } finally {
     Write-Log 'exit'
