@@ -32,6 +32,7 @@ param(
     [string]$LogPath = "$env:TEMP\dsh-translate-capture.log",
     [switch]$SelfTest,
     [switch]$Probe,
+    [switch]$TestOverlay,
     [switch]$NoUi
 )
 
@@ -478,6 +479,30 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
     Start-Translate $text $point.X $point.Y
 }
 
+# ───────────────────────────── 浮窗冒烟：造一次窗、画一帧、然后退出 ─────────────────────────────
+
+if ($TestOverlay) {
+    $ok = $false
+    $err = ''
+    try {
+        $pt = [DTWin32+POINT]::new()
+        [void][DTWin32]::GetCursorPos([ref]$pt)
+        Show-Overlay '译文 → 简体中文' '这是一条浮窗冒烟测试：能看到这行字就说明原生置顶窗口正常。' $pt.X $pt.Y
+        $deadline = [Environment]::TickCount + 2500
+        while ([Environment]::TickCount -lt $deadline) {
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 50
+        }
+        Hide-Overlay
+        if ($script:Overlay -and -not $script:Overlay.IsDisposed) { $script:Overlay.Dispose() }
+        $ok = $true
+    } catch {
+        $err = $_.Exception.Message
+    }
+    @{ ok = $ok; error = $err } | ConvertTo-Json
+    if ($ok) { exit 0 } else { exit 1 }
+}
+
 # ───────────────────────────── 探针：光标处能不能取到选区 ─────────────────────────────
 
 if ($Probe) {
@@ -539,16 +564,37 @@ if ($SelfTest) {
 
 # ───────────────────────────── 单实例 + 主循环 ─────────────────────────────
 
-$mutexName = "Global\dsh-translate-capture"
+# 单实例：会话内互斥体（Local\ 不需要 SeCreateGlobalPrivilege）；建不出来就用 PID 文件兜底
+$mutexName = "Local\dsh-translate-capture"
+$pidFile = Join-Path $env:TEMP 'dsh-translate-capture.pid'
 $mutex = $null
+$ownedPidFile = $false
 try {
     $mutex = New-Object System.Threading.Mutex($false, $mutexName)
-    if (-not $mutex.WaitOne(0)) {
+    # 重启时新进程可能比旧进程先起来：留 3 秒等旧实例退场，别把自己也退掉
+    if (-not $mutex.WaitOne(3000)) {
         Write-Log 'another instance holds the mutex; exiting'
         exit 0
     }
 } catch {
-    # 全局互斥体在受限会话里可能创建失败：继续跑，靠 DSH 的 PID 管理兜底
+    $mutex = $null
+}
+if (-not $mutex) {
+    try {
+        if (Test-Path $pidFile) {
+            $oldPid = 0
+            [void][int]::TryParse((Get-Content $pidFile -Raw).Trim(), [ref]$oldPid)
+            if ($oldPid -gt 0) {
+                $old = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $oldPid) -ErrorAction SilentlyContinue
+                if ($old -and $old.CommandLine -like '*dsh-translate-capture.ps1*') {
+                    Write-Log 'another instance is running (pid file); exiting'
+                    exit 0
+                }
+            }
+        }
+        Set-Content -Path $pidFile -Value $PID -Encoding ASCII
+        $ownedPidFile = $true
+    } catch { }
 }
 
 Write-Log ("start version=" + $script:ScriptVersion + " port=" + $Port + " target=" + $Target + " parent=" + $ParentPid)
@@ -620,4 +666,5 @@ try {
     try { if ($script:Overlay -and -not $script:Overlay.IsDisposed) { $script:Overlay.Dispose() } } catch { }
     try { $script:Http.Dispose() } catch { }
     if ($mutex) { try { $mutex.ReleaseMutex() } catch { } ; $mutex.Dispose() }
+    if ($ownedPidFile) { try { Remove-Item $pidFile -Force -ErrorAction SilentlyContinue } catch { } }
 }

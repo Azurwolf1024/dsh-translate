@@ -49,7 +49,10 @@ powershell.exe -NoProfile -STA -ExecutionPolicy Bypass   -File helper/dsh-transl
 #    输出 uia / clipboard 两条路各自读到了什么、这次会走哪条
 powershell.exe -NoProfile -STA -ExecutionPolicy Bypass   -File helper/dsh-translate-capture.ps1 -Port 61213 -Probe
 
-# 3) 日志（每次手势、取词来源、启动/退出都会写）
+# 3) 浮窗冒烟：屏幕右下角闪一个 2.5 秒的小窗（验证原生置顶窗口能画出来）
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass   -File helper/dsh-translate-capture.ps1 -TestOverlay
+
+# 4) 日志（每次手势、取词来源、启动/退出都会写）
 type %TEMP%\dsh-translate-capture.log
 ```
 
