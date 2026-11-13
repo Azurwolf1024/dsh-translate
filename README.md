@@ -8,9 +8,59 @@
 | 入口 | 说明 |
 |---|---|
 | **整页工作台** | 左侧栏面板图标「翻译」→ 整页视图，三个页签：文本 / 文件 / 设置 |
-| **划译** | 选中一段文字后**停顿 500ms**（可调）自动弹出译文浮层；Esc / 点空白 / 滚动即取消 |
+| **划译（DSH 页面内）** | 选中一段文字后**停顿 500ms**（可调）自动弹出译文浮层；Esc / 点空白 / 滚动即取消 |
+| **划译（任意应用）** | 系统级：在 Word / 浏览器 / PDF 阅读器里选中文字即译，浮窗贴着光标弹出（见下节） |
 | **小图标** | 右下角悬浮按钮：左键打开工作台，**右键菜单**里有「开启/关闭划译」「加载/关闭模型」「刷新状态」「设置」 |
 | **文件翻译** | 拖入或选择文件 → 自动按段落切分 → 逐段翻译 → 双语对照导出 `.md` |
+
+## 外部划译（系统级，任意应用）
+
+页面里的 JS 读不到别的程序的选区，所以外部划译由同包的**伴生进程**承担（Windows 自带 PowerShell 5.1，
+零外部依赖）：
+
+```
+任意应用里选中文字
+  ↓ 全局鼠标轮询：拖选（位移 ≥5px）/ 双击选词
+  ↓ UI Automation  TextPattern.GetSelection()      ← 主路径，不碰剪贴板
+  ↓ 读不到才注入一次 Ctrl+C 读剪贴板（带扫描码；读完还原；终端窗口跳过）
+  ↓ POST /dsh-translate/api                        ← 同一条无状态翻译链路
+  ↓ 光标旁原生置顶浮窗：译文 / 复制 / 关闭（Esc、点外、20s 自动收起）
+```
+
+- **不需要热键**：划译总开关 + 「外部（任意应用）」都开（默认都是开）就生效。
+- **不重复弹窗**：伴生进程认出 DSH 桌面端窗口（进程 `DeepSeek Harness`）就跳过——那个窗口
+  交给页面内浮层；`设置 → DSH 页面内也显示浮层`（默认开）控制页面内浮层本身。
+  如果你在普通浏览器里开 DSH 网页，系统侧无法区分标签页，两者会同时出现，关掉页面内浮层即可。
+- **剪贴板纪律**：UIA 读得到就一个字节都不碰剪贴板；只有读不到才注入一次 Ctrl+C，
+  注入前保存、读到文字后还原；你此刻正按着 Ctrl 就不注入；控制台/终端类窗口直接跳过
+  （Ctrl+C 在那里是中断）。
+- **清理**：浮窗只承载当前结果；伴生进程随 DSH 走 —— 父进程消失就自己退出，DSH 停用/卸载
+  插件时也会杀掉它；模型卸载仍由 Host 的空闲卸载器负责。
+- **进程**：`powershell.exe -STA`（5.1，系统自带），端口取当前页面端口，
+  日志 `%TEMP%\dsh-translate-capture.log`。
+
+排障：
+
+```bash
+# 1) 伴生进程自检：装配 UIA/WinForms、GET 状态、真机翻一句，然后退出（不弹窗）
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass   -File helper/dsh-translate-capture.ps1 -Port 61213 -Target zh-Hans -SelfTest
+
+# 2) 探针：先在目标应用里选中一段文字（别松手后点别处），再跑它——
+#    输出 uia / clipboard 两条路各自读到了什么、这次会走哪条
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass   -File helper/dsh-translate-capture.ps1 -Port 61213 -Probe
+
+# 3) 日志（每次手势、取词来源、启动/退出都会写）
+type %TEMP%\dsh-translate-capture.log
+```
+
+已知边界：Chromium / WebView2 的**无障碍树是「被 UIA 问到才打开」**，首次划词可能读到空
+（脚本会自动 160ms 重试一次，并退回焦点元素兜底）；Qt 版 WPS、部分 Office 完全不暴露文档
+文本，这类只能走剪贴板兜底；浏览器标签页里的 DSH 页面无法从系统侧区分，双弹窗用上面的
+让位开关解决。
+
+参考实现：[germyGao/dsh-select-assist](https://github.com/germyGao/dsh-select-assist)、
+[chatclaw 的 Windows 选区检测研究](https://github.com/zhimaai/chatclaw/blob/24cf23210f48daacd4d301bb771fc42745a42ee7/docs/windows-text-selection-detection-research.md)、
+[pot-app/pot-desktop](https://github.com/pot-app/pot-desktop)。
 
 ## 翻译内核与「清理」
 
@@ -82,7 +132,7 @@ node tests/client_selftest.mjs
 
 - 一次只翻一段（串行），保证小模型显存与延迟稳定；取消会立刻停止后续段。
 - `繁體中文` 用中文语言名 + 中文提示驱动（1.8B 模型对英文语言名会输出简体），实测短句/段落/简→繁都稳定。
-- 划译只作用于页面内可选中的文本；输入框/可编辑区域/DOM 之外的选区会被忽略。
+- 页内划译只作用于页面内可选中的文本；输入框/可编辑区域/DOM 之外的选区会被忽略（外部划译另外处理）。
 - 路由只在回环地址上服务，没有额外的令牌鉴权（与宿主自身「只绑回环」的部署假设一致）；
   请求侧校验 `Origin` / `Sec-Fetch-Site`，跨站请求一律 403。
 - 宿主配置（`idleUnloadMs` 等）只能改 `cordis.patch.yml`，设置页里是只读展示。

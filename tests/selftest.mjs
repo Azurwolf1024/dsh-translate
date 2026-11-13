@@ -199,6 +199,16 @@ check(
     .join('|') === 'Hello there.|Second line.',
 )
 
+const external = await callRoute(route, { body: JSON.stringify({ action: 'externalStatus' }) })
+check(
+  'externalStatus 报告伴生进程状态',
+  external.json?.ok === true && external.json.external.helperExists === true && external.json.external.supported === true,
+  JSON.stringify(external.json?.external),
+)
+
+const badPort = await callRoute(route, { body: JSON.stringify({ action: 'externalStart', port: 999999 }) })
+check('非法端口被拒绝', badPort.json?.ok === false && badPort.json.error.code === 'BAD_REQUEST')
+
 const empty = await callRoute(route, { body: JSON.stringify({ action: 'translate', text: '   ' }) })
 check('空文本被拒绝', empty.status === 400 && empty.json.error.code === 'BAD_REQUEST')
 

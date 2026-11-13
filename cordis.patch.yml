@@ -1,5 +1,8 @@
 # dsh-translate bundle 层：一个 Host 行 + 它的 Client 半边（package.json 的 dsh.client）。
 #
+# 外部划译（系统级）由同包的 helper/dsh-translate-capture.ps1 承担，进程由 Host 拉起/回收，
+# 这里不涉及它的开关（开关在前端「设置 → 划译」，默认开）。
+#
 # Host 行为完全由下面的 config 驱动，改这里即改默认值；用户界面里的「设置」页只覆盖
 # 单次会话内的偏好（存 localStorage），不会写回本文件。
 - insert:

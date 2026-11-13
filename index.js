@@ -23,6 +23,11 @@
  */
 
 import { inflateRawSync } from 'node:zlib'
+import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 export const ROUTE_PATH = '/dsh-translate/api'
 
@@ -553,6 +558,13 @@ export function extractText({ name, bytes }) {
 
 /* ─────────────────────────────── 配置归一 ─────────────────────────────── */
 
+/** 外部划译伴生进程（Windows PowerShell 5.1，零外部依赖）。 */
+export const HELPER_FILE = join(dirname(fileURLToPath(import.meta.url)), 'helper', 'dsh-translate-capture.ps1')
+export const HELPER_LOG = join(tmpdir(), 'dsh-translate-capture.log')
+
+/** 外部划译的默认端口（真正用哪个由客户端从 location.port 传进来）。 */
+const FALLBACK_PORT = 61213
+
 export const DEFAULTS = Object.freeze({
   baseURL: 'http://127.0.0.1:11434',
   model: 'kaelri/hy-mt2:1.8b',
@@ -673,6 +685,131 @@ async function unloadModel(cfg, signal) {
   })
 }
 
+/* ──────────────────────────── 外部划译（系统级伴生进程） ──────────────────────────── */
+
+function helperCommand(port, target, tone) {
+  const powershell = join(process.env.SystemRoot || 'C:\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  const exe = existsSync(powershell) ? powershell : 'powershell.exe'
+  return {
+    exe,
+    args: [
+      '-NoProfile',
+      '-STA',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-File',
+      HELPER_FILE,
+      '-Port',
+      String(port),
+      '-Target',
+      target,
+      '-Tone',
+      tone,
+      '-ParentPid',
+      String(process.pid),
+      '-LogPath',
+      HELPER_LOG,
+    ],
+  }
+}
+
+/** 外部划译伴生进程的当前状态（客户端据此显示「运行中/失败」）。 */
+export function externalSnapshot(state) {
+  const ext = state.external
+  const running = !!(ext.child && ext.child.exitCode === null && !ext.child.killed)
+  return {
+    supported: process.platform === 'win32',
+    running,
+    pid: running ? ext.pid : null,
+    startedAt: ext.startedAt || null,
+    port: ext.port || null,
+    target: ext.target || null,
+    tone: ext.tone || null,
+    error: ext.error || null,
+    helperExists: existsSync(HELPER_FILE),
+    helperPath: HELPER_FILE,
+    logPath: HELPER_LOG,
+    diag: { ...state.diag },
+  }
+}
+
+function stopExternal(state) {
+  const ext = state.external
+  const child = ext.child
+  const pid = ext.pid
+  ext.child = null
+  ext.pid = null
+  ext.startedAt = 0
+  if (!child) return
+  try {
+    child.kill()
+  } catch (error) {
+    /* 已经退出 */
+  }
+  // PowerShell 偶发无视 TerminateProcess：1 秒后还在就 taskkill /T /F 收尸
+  if (process.platform === 'win32' && pid) {
+    const timer = setTimeout(() => {
+      if (child.exitCode !== null) return
+      try {
+        spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
+      } catch (error) {
+        /* 已经没了 */
+      }
+    }, 1000)
+    if (typeof timer.unref === 'function') timer.unref()
+  }
+}
+
+function startExternal(state, body) {
+  state.diag.externalStarts += 1
+  if (process.platform !== 'win32') throw new TranslateError('UNSUPPORTED', '外部划译目前只支持 Windows')
+  if (!existsSync(HELPER_FILE)) throw new TranslateError('HELPER_MISSING', `伴生进程脚本缺失：${HELPER_FILE}`)
+  // 以宿主自己监听的端口为准；客户端的 location.port 在桌面壳里可能是空/默认端口，只做兜底。
+  const port = Number(state.webPort) || Number(body.port) || FALLBACK_PORT
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new TranslateError('BAD_REQUEST', '端口不合法')
+  const cfg = applyOverrides(state, body)
+  const target = typeof body.targetLanguage === 'string' && body.targetLanguage ? body.targetLanguage : cfg.defaultTarget
+  const tone = TONES[body.tone] ? body.tone : cfg.tone
+  const ext = state.external
+  const running = !!(ext.child && ext.child.exitCode === null)
+  if (running && ext.port === port && ext.target === target && ext.tone === tone) return externalSnapshot(state)
+
+  stopExternal(state)
+  const command = helperCommand(port, target, tone)
+  let child
+  try {
+    child = spawn(command.exe, command.args, { windowsHide: true, stdio: 'ignore', detached: false })
+  } catch (error) {
+    throw new TranslateError('HELPER_SPAWN_FAILED', `无法启动伴生进程：${error?.message || error}`)
+  }
+  ext.child = child
+  ext.pid = child.pid ?? null
+  ext.startedAt = Date.now()
+  ext.port = port
+  ext.target = target
+  ext.tone = tone
+  ext.error = null
+  child.on('error', (error) => {
+    if (state.external.child === child) {
+      state.external.error = `伴生进程启动失败：${error?.message || error}`
+      state.external.child = null
+      state.external.pid = null
+    }
+  })
+  child.on('exit', (code) => {
+    if (state.external.child === child) {
+      state.external.child = null
+      state.external.pid = null
+      state.external.startedAt = 0
+      if (code !== 0 && code !== null) {
+        state.external.error = `伴生进程退出（code ${code}），详见 ${HELPER_LOG}`
+      }
+    }
+  })
+  state.log('info', `外部划译伴生进程已启动（pid ${child.pid}, port ${port}, target ${target}）`)
+  return externalSnapshot(state)
+}
+
 /* ─────────────────────────────── 服务状态 ─────────────────────────────── */
 
 function createState(cfg, ctx) {
@@ -680,6 +817,12 @@ function createState(cfg, ctx) {
     cfg,
     ctx,
     lastActivity: 0,
+    /** 外部划译伴生进程句柄与最近参数。 */
+    external: { child: null, pid: null, startedAt: 0, port: null, target: null, tone: null, error: null },
+    /** 诊断计数：客户端是否真的在调外部划译接口（排查「页面没热更到新 bundle」）。 */
+    diag: { externalStarts: 0, externalStatus: 0, since: Date.now() },
+    /** 本进程 webServer 实际监听的端口（外部划译伴生进程用它，客户端端口只是兜底）。 */
+    webPort: null,
     /** 本插件触发过加载的模型名；卸载以它为准，避免用户换模型后卸错对象。 */
     touchedModels: new Set(),
     pinned: false,
@@ -930,6 +1073,20 @@ async function handleAction(state, body, signal) {
     return { ok: true, status: await statusOf(state, signal, cfg) }
   }
 
+  if (action === 'externalStart') {
+    return { ok: true, external: startExternal(state, body) }
+  }
+
+  if (action === 'externalStop') {
+    stopExternal(state)
+    return { ok: true, external: externalSnapshot(state) }
+  }
+
+  if (action === 'externalStatus') {
+    state.diag.externalStatus += 1
+    return { ok: true, external: externalSnapshot(state) }
+  }
+
   if (action === 'extract') {
     const name = String(body.name || '')
     const base64 = String(body.dataBase64 || '')
@@ -1056,6 +1213,7 @@ export function apply(ctx, rawConfig) {
       state.log('warn', '没有 webServer 服务，翻译路由未注册')
       return
     }
+    if (typeof webServer.port === 'number' && webServer.port > 0) state.webPort = webServer.port
     scope.effect(
       () =>
         webServer.register({
@@ -1085,6 +1243,7 @@ export function apply(ctx, rawConfig) {
   ctx.effect(
     () => () => {
       state.disposed = true
+      stopExternal(state)
       for (const controller of state.inflight) controller.abort()
       state.inflight.clear()
       if (state.touchedModels.size > 0) {

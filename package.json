@@ -1,8 +1,8 @@
 {
   "name": "dsh-translate",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Local Ollama translation plugin for DeepSeek Harness: text, selection popup and file translation with a stateless, unload-after-use model kernel.",
+  "description": "Local Ollama translation for DeepSeek Harness: in-page selection, system-wide selection (UI Automation with clipboard fallback), text and file translation. Stateless, unloads the model when idle.",
   "type": "module",
   "main": "./index.js",
   "exports": {
@@ -19,7 +19,8 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
-    "tests/*.mjs"
+    "tests/*.mjs",
+    "helper/*.ps1"
   ],
   "engines": {
     "node": ">=20"

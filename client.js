@@ -73,6 +73,8 @@ window.__ModuleLoader__.load({
 			tone: 'natural',
 			glossary: '',
 			selectionEnabled: true,
+			externalEnabled: true,
+			pageOverlay: true,
 			selectionDelayMs: 500,
 			model: '',
 			keepAlive: '5m',
@@ -220,6 +222,7 @@ window.__ModuleLoader__.load({
 			statusBusy: false,
 			activeTab: 'text',
 			selection: null,
+			external: null,
 			menu: null,
 			toast: null,
 			overlayOpen: false
@@ -340,6 +343,213 @@ window.__ModuleLoader__.load({
 			} catch (error) {
 				toast('卸载失败：' + (error.message || error));
 			}
+		}
+
+		/* ═══════════════════════ 外部划译（系统级伴生进程） ═══════════════════════ */
+
+		function apiPort() {
+			try {
+				var parsed = new window.URL(apiUrl());
+				if (parsed.port) return Number(parsed.port);
+				return parsed.protocol === 'https:' ? 443 : 80;
+			} catch (error) {
+				return 61213;
+			}
+		}
+
+		var externalInFlight = null;
+
+		async function refreshExternal() {
+			try {
+				var data = await api('externalStatus', {});
+				patch({ external: data.external });
+				return data.external;
+			} catch (error) {
+				patch({ external: { supported: true, running: false, error: error.message || String(error) } });
+				return null;
+			}
+		}
+
+		function startExternal() {
+			if (externalInFlight) return externalInFlight;
+			externalInFlight = api('externalStart', {
+				port: apiPort(),
+				targetLanguage: store.settings.targetLanguage,
+				tone: store.settings.tone
+			})
+				.then(function (data) {
+					patch({ external: data.external });
+					return data.external;
+				})
+				.catch(function (error) {
+					patch({
+						external: {
+							supported: true,
+							running: false,
+							error: error.message || String(error),
+							logPath: '%TEMP%\dsh-translate-capture.log'
+						}
+					});
+					throw error;
+				})
+				.then(function (value) {
+					externalInFlight = null;
+					return value;
+				});
+			return externalInFlight;
+		}
+
+		async function stopExternal() {
+			try {
+				var data = await api('externalStop', {});
+				patch({ external: data.external });
+			} catch (error) {
+				/* 宿主已经不在：忽略 */
+			}
+		}
+
+		async function toggleExternal(next) {
+			setSettings({ externalEnabled: !!next });
+			if (!next) {
+				toast('外部划译已关闭');
+				return;
+			}
+			toast('正在启动外部划译…');
+			try {
+				await startExternal();
+				toast(store.settings.selectionEnabled ? '外部划译已启动（选中即译）' : '外部划译已启动；总开关还是关的');
+			} catch (error) {
+				toast('外部划译启动失败：' + (error.message || error));
+			}
+		}
+
+		async function retryExternal() {
+			toast('正在重启伴生进程…');
+			await stopExternal();
+			try {
+				await startExternal();
+				toast('伴生进程已重启');
+			} catch (error) {
+				toast('重启失败：' + (error.message || error));
+			}
+		}
+
+		/** 系统级划译的开关/状态行（设置页复用）。 */
+		function ExternalSettingsRows(s) {
+			var ext = s.external || {};
+			var statusText = ext.running
+				? '运行中 · pid ' + ext.pid
+				: ext.error
+					? '未运行：' + ext.error
+					: ext.supported === false
+						? '仅支持 Windows'
+						: '未运行（总开关或本开关关闭）';
+			var statusClass = 'dstr-chip' + (ext.running ? ' ok' : ext.error ? ' err' : '');
+			return [
+				h(
+					'div',
+					{ className: 'dstr-switch', key: 'ext-switch' },
+					h('span', { className: 'dstr-hint' }, '外部（任意应用，选中即译，无需热键）'),
+					h(
+						'button',
+						{
+							key: 'ext-btn',
+							type: 'button',
+							className: 'dstr-switch-btn',
+							role: 'switch',
+							'aria-checked': s.settings.externalEnabled ? 'true' : 'false',
+							'aria-label': '外部划译开关',
+							onClick: function () {
+								toggleExternal(!s.settings.externalEnabled);
+							}
+						},
+						h('i', null)
+					)
+				),
+				h(
+					'div',
+					{ className: 'dstr-row', key: 'ext-status' },
+					h('span', { className: statusClass }, statusText),
+					h('button', { key: 'ext-retry', type: 'button', className: 'dstr-btn ghost', onClick: retryExternal }, '重启伴生进程')
+				),
+				h(
+					'div',
+					{ className: 'dstr-hint', key: 'ext-hint' },
+					'UIA 优先（不碰剪贴板）；读不到才注入一次 Ctrl+C 并还原剪贴板；终端窗口跳过。日志：' +
+						(ext.logPath || '%TEMP%\dsh-translate-capture.log')
+				),
+				h(
+					'div',
+					{ className: 'dstr-switch', key: 'page-switch' },
+					h('span', { className: 'dstr-hint' }, 'DSH 页面内也显示浮层（两者同开会在页面里双弹窗）'),
+					h(
+						'button',
+						{
+							key: 'page-btn',
+							type: 'button',
+							className: 'dstr-switch-btn',
+							role: 'switch',
+							'aria-checked': s.settings.pageOverlay ? 'true' : 'false',
+							'aria-label': '页面内浮层开关',
+							onClick: function () {
+								setSettings({ pageOverlay: !s.settings.pageOverlay });
+							}
+						},
+						h('i', null)
+					)
+				)
+			];
+		}
+
+		/** 总开关 + 外部开关都开时，起伴生进程；任一关闭就收掉它。 */
+		function ExternalBridge() {
+			var s = useStore();
+			var want = !!(s.settings.selectionEnabled && s.settings.externalEnabled);
+			useEffect(
+				function () {
+					var disposed = false;
+					var poll = null;
+					var retry = null;
+					if (!want) {
+						stopExternal();
+						return;
+					}
+					function ensureStarted() {
+						if (disposed) return;
+						startExternal()
+							.catch(function () {
+								/* 错误已经写进 store.external */
+							})
+							.then(function () {
+								if (disposed) return;
+								window.setTimeout(function () {
+									if (!disposed) refreshExternal();
+								}, 1800);
+							});
+					}
+					ensureStarted();
+					// 宿主刚热更完时首次 start 可能落在路由注册之前：只要还没跑起来就隔一会儿再试一次。
+					var kicks = 0;
+					poll = window.setInterval(function () {
+						if (disposed) return;
+						refreshExternal().then(function (ext) {
+							if (disposed || !ext) return;
+							if (!ext.running && !ext.error && kicks < 6) {
+								kicks += 1;
+								startExternal().catch(function () {});
+							}
+						});
+					}, 12000);
+					return function () {
+						disposed = true;
+						if (poll) window.clearInterval(poll);
+						if (retry) window.clearTimeout(retry);
+						stopExternal();
+					};
+				},
+				[want, store.settings.targetLanguage, store.settings.tone]
+			);
+			return null;
 		}
 
 		/* ═══════════════════════════ 划译（选区） ═══════════════════════════ */
@@ -620,6 +830,7 @@ window.__ModuleLoader__.load({
 			var status = s.status;
 			var loaded = !!(status && status.loaded);
 			var enabled = s.settings.selectionEnabled;
+			var externalOn = !!s.settings.externalEnabled;
 			var rect = useRef(null);
 			var op = useRef(null);
 			var place = useRef(null);
@@ -692,6 +903,13 @@ window.__ModuleLoader__.load({
 				enabled
 					? item('关闭划译', '当前：开', function () { setSettings({ selectionEnabled: false }); toast('划译已关闭'); })
 					: item('开启划译', '当前：关', function () { setSettings({ selectionEnabled: true }); toast('划译已开启'); }),
+				item(
+					externalOn ? '关闭外部划译' : '开启外部划译',
+					s.external && s.external.running ? '运行中（系统级）' : '系统级 / 未运行',
+					function () {
+						toggleExternal(!externalOn);
+					}
+				),
 				loaded ? item('关闭模型', '释放内存', unloadModel) : item('加载模型', '预热到内存', loadModel),
 				item('刷新状态', '', refreshStatus, s.statusBusy),
 				h('div', { className: 'dstr-menu-sep' }),
@@ -824,7 +1042,9 @@ window.__ModuleLoader__.load({
 		/* 划译监听器：开关关闭时不挂任何监听。 */
 		function SelectionBridge() {
 			var s = useStore();
-			var enabled = s.settings.selectionEnabled;
+			var externalRunning = !!(s.external && s.external.running);
+			// 外部划译在跑时，页面内默认让位（避免双弹窗）；pageOverlay 可强行都开。
+			var enabled = s.settings.selectionEnabled && (s.settings.pageOverlay || !externalRunning);
 			var delay = s.settings.selectionDelayMs;
 			var settingsRef = useRef(store.settings);
 			settingsRef.current = store.settings;
@@ -1556,6 +1776,7 @@ window.__ModuleLoader__.load({
 							h('i', null)
 						)
 					),
+					ExternalSettingsRows(store),
 					field(
 						'停顿（毫秒）',
 						h('input', {
@@ -1571,7 +1792,11 @@ window.__ModuleLoader__.load({
 						}),
 						'选中后多久开始翻译；Esc / 点空白 / 滚动会取消'
 					),
-					h('div', { className: 'dstr-hint' }, '关闭后不注册任何选区监听，行为与未装插件一致。')
+					h(
+						'div',
+						{ className: 'dstr-hint' },
+						'总开关关闭：页内不注册任何选区监听，外部伴生进程也会退出。外部划译在跑时，页面内浮层默认让位。'
+					)
 				),
 				h(
 					'div',
@@ -1790,7 +2015,7 @@ window.__ModuleLoader__.load({
 
 			ctx.slots.inject('shell.overlay', function () {
 				return ctx.slots.register({ name: 'shell.overlay', id: 'translate-selection', order: 190 }, function SelectionLayer() {
-					return h('div', { 'data-dstr-ui': '1' }, h(Styles, null), h(SelectionBridge, null), h(SelectionPopover, null), h(OverlayWorkbench, null));
+					return h('div', { 'data-dstr-ui': '1' }, h(Styles, null), h(ExternalBridge, null), h(SelectionBridge, null), h(SelectionPopover, null), h(OverlayWorkbench, null));
 				});
 			});
 		}

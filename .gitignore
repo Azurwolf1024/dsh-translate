@@ -4,6 +4,7 @@ lib/
 dist/
 
 # 测试/临时产物
+.probe/
 *.log
 *.tmp
 tests/fixtures/*.译文.*
