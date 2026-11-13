@@ -34,7 +34,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '1.2.2'
+$script:ScriptVersion = '1.2.4'
 $script:ThemePath = $ThemePath
 
 # ───────────────────────────── 日志 ─────────────────────────────
@@ -877,13 +877,24 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
         }
     }
     if (-not $script:Anchor) { Set-AnchorFromRects $point $null }
-    if (-not $text -or $text.Trim().Length -eq 0) {
+    # 关键：先 Trim 再判空白。PDF 文本层给出的选区常常以 
+ 结尾，
+    # 之前先判 \s 会把"末尾换行"当成"有空白"，于是永远跳过兜底 → 只剩残缺的 TheInnerProduct。
+    if ($text) { $text = $text.Trim() }
+    if (-not $text) {
         $source = 'clipboard'
         try { $text = Get-SelectionViaClipboard ($hwnd) } catch { $text = '' }
+        if ($text) { $text = $text.Trim() }
+        # 剪贴板这条路也一样：Edge 的 PDF 阅读器复制出来的文本也可能没有词间空格
+        if ($text -and $text -notmatch '\s' -and $text.Length -ge 8) {
+            $text = Restore-WordSpacing $text
+            $source = 'clipboard-respaced'
+        }
     } elseif ($text -notmatch '\s' -and $text.Length -ge 8) {
-        # UIA 读到了但完全没有空白：多半是 PDF 文本层，剪贴板通常更准
+        # 完全没有词间空白：多半是 PDF 文本层，剪贴板通常更准
         $rescued = ''
         try { $rescued = Get-SelectionViaClipboard ($hwnd) } catch { $rescued = '' }
+        if ($rescued) { $rescued = $rescued.Trim() }
         if ($rescued -and $rescued -match '\s') {
             $text = $rescued
             $source = 'clipboard-rescue'

@@ -1,6 +1,6 @@
 {
   "name": "dsh-translate",
-  "version": "1.2.2",
+  "version": "1.2.4",
   "private": true,
   "description": "Local Ollama translation for DeepSeek Harness: in-page selection, system-wide selection (UI Automation with clipboard fallback), text and file translation. Stateless, unloads the model when idle.",
   "type": "module",
