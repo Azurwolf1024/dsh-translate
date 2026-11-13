@@ -34,7 +34,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '1.2.4'
+$script:ScriptVersion = '1.2.5'
 $script:ThemePath = $ThemePath
 
 # ───────────────────────────── 日志 ─────────────────────────────
@@ -877,9 +877,8 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
         }
     }
     if (-not $script:Anchor) { Set-AnchorFromRects $point $null }
-    # 关键：先 Trim 再判空白。PDF 文本层给出的选区常常以 
- 结尾，
-    # 之前先判 \s 会把"末尾换行"当成"有空白"，于是永远跳过兜底 → 只剩残缺的 TheInnerProduct。
+    # 关键：先 Trim 再判空白。PDF 选区文本常以 CRLF 结尾，末尾换行会被误判成词间空白，
+    # 从而永远跳过下面的兜底（之前就栽在这里：看起来取不到词，其实是不再补空格）。
     if ($text) { $text = $text.Trim() }
     if (-not $text) {
         $source = 'clipboard'
@@ -1031,6 +1030,28 @@ if ($SelfTest) {
         error      = $null
     }
     try {
+        # 源码自检：非注释行以中文开头 → 一定是被转义劈开的坏行（曾经因此「划词没反应」）
+        $suspicious = @()
+        try {
+            foreach ($line in (Get-Content -Path $PSCommandPath -Encoding UTF8)) {
+                if ($line -match '^\s*[\u4e00-\u9fff]') { $suspicious += $line.Trim() }
+            }
+        } catch { }
+        $result.sourceLint = ($suspicious.Count -eq 0)
+        if ($suspicious.Count -gt 0) { $result.sourceLintSample = ($suspicious | Select-Object -First 3) -join ' | ' }
+
+        # 取词后处理与锚点的纯逻辑断言
+        $spaced = Restore-WordSpacing 'TheInnerProduct'
+        $untouched = Restore-WordSpacing 'u and v are vectors'
+        Set-AnchorFromRects ([DTWin32+POINT]@{ X = 100; Y = 200 }) @(@{ left = 90; top = 180; right = 400; bottom = 260 })
+        $anchorOk = ($script:Anchor.left -eq 90 -and $script:Anchor.bottom -eq 260)
+        $result.logic = @{
+            respace     = $spaced
+            respaceOk   = ($spaced -eq 'The Inner Product')
+            keepSpaces  = ($untouched -eq 'u and v are vectors')
+            anchorOk    = $anchorOk
+        }
+
         $result.uia = ($null -ne [System.Windows.Automation.AutomationElement])
         $result.winforms = ($null -ne [System.Windows.Forms.Cursor])
         $statusJson = (Invoke-WebRequest -Uri $script:ApiUrl -Method Get -UseBasicParsing -TimeoutSec 10).Content
@@ -1040,7 +1061,7 @@ if ($SelfTest) {
         $resp = Invoke-WebRequest -Uri $script:ApiUrl -Method Post -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($payload)) -UseBasicParsing -TimeoutSec 60
         $parsed = $resp.Content | ConvertFrom-Json
         $result.translate = @{ ok = $parsed.ok; text = $parsed.text; target = $parsed.targetLanguage }
-        $result.ok = ($result.httpStatus -and $parsed.ok -eq $true)
+        $result.ok = ($result.httpStatus -and $parsed.ok -eq $true -and $result.sourceLint -and $result.logic.respaceOk -and $result.logic.keepSpaces -and $result.logic.anchorOk)
     } catch {
         $result.error = $_.Exception.Message
     }
