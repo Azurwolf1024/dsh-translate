@@ -347,6 +347,14 @@ window.__ModuleLoader__.load({
 
 		/* ═══════════════════════ 外部划译（系统级伴生进程） ═══════════════════════ */
 
+		function isWindowsHost() {
+			try {
+				return /Windows/i.test(String(window.navigator.userAgent || ''));
+			} catch (error) {
+				return false;
+			}
+		}
+
 		function apiPort() {
 			try {
 				var parsed = new window.URL(apiUrl());
@@ -479,6 +487,10 @@ window.__ModuleLoader__.load({
 		}
 
 		async function toggleExternal(next) {
+			if (next && !isWindowsHost()) {
+				toast('外部划译仅支持 Windows；页内划译不受影响');
+				return;
+			}
 			setSettings({ externalEnabled: !!next });
 			if (!next) {
 				toast('外部划译已关闭');
@@ -515,11 +527,12 @@ window.__ModuleLoader__.load({
 						? '仅支持 Windows'
 						: '未运行（总开关或本开关关闭）';
 			var statusClass = 'dstr-chip' + (ext.running ? ' ok' : ext.error ? ' err' : '');
+			var platformBlocked = ext.supported === false;
 			return [
 				h(
 					'div',
 					{ className: 'dstr-switch', key: 'ext-switch' },
-					h('span', { className: 'dstr-hint' }, '外部（任意应用，选中即译，无需热键）'),
+					h('span', { className: 'dstr-hint' }, platformBlocked ? '外部（仅 Windows 可用；页内划译不受影响）' : '外部（任意应用，选中即译，无需热键）'),
 					h(
 						'button',
 						{
@@ -582,6 +595,11 @@ window.__ModuleLoader__.load({
 					var retry = null;
 					if (!want) {
 						stopExternal();
+						return;
+					}
+					if (!isWindowsHost()) {
+						// 外部划译是 Windows 专属（UI Automation / 剪贴板注入 / 原生浮窗）；页内划译不受影响
+						patch({ external: { supported: false, running: false, error: null } });
 						return;
 					}
 					function ensureStarted() {
@@ -807,6 +825,12 @@ window.__ModuleLoader__.load({
 			'.dstr-row .dstr-spacer{flex:1 1 auto;}',
 			'.dstr-meta{font-size:11px;color:var(--dsw-alias-label-secondary);display:flex;gap:10px;flex-wrap:wrap;}',
 			'.dstr-error{border:1px solid var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary);background:transparent;border-radius:8px;padding:8px 10px;font-size:12px;line-height:1.5;}',
+			'.dstr-notice{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:12px 18px 0;padding:10px 12px;border-radius:10px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);font-size:12px;line-height:1.55;}',
+			'.dstr-notice.err{border-color:var(--dsw-alias-state-error-primary);}',
+			'.dstr-notice.warn{border-color:var(--dsw-alias-state-warn-primary);}',
+			'.dstr-notice-main{font-weight:600;color:var(--dsw-alias-label-primary);}',
+			'.dstr-notice .dstr-spacer{flex:1 1 auto;}',
+			'.dstr-code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;padding:2px 6px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);}',
 
 			/* 文件页 */
 			'.dstr-drop{border:1.5px dashed var(--dsw-alias-border-l2);border-radius:12px;padding:26px 18px;text-align:center;color:var(--dsw-alias-label-secondary);cursor:pointer;transition:border-color .12s ease,background .12s ease;}',
@@ -1193,6 +1217,48 @@ window.__ModuleLoader__.load({
 
 		/* ═════════════════════════════ 工作台 ═════════════════════════════ */
 
+		function SetupNotice() {
+			var s = useStore();
+			var status = s.status;
+			if (!status) return null;
+			if (status.reachable === false) {
+				return h(
+					'div',
+					{ className: 'dstr-notice err' },
+					h('span', { className: 'dstr-notice-main' }, '连不上本地 Ollama（' + (status.baseURL || '127.0.0.1:11434') + '）'),
+					h('span', { className: 'dstr-hint' }, '先装好并启动 Ollama（`ollama serve` 或打开 Ollama 应用），再点右边重新检测。'),
+					h('span', { className: 'dstr-spacer' }),
+					h('button', { type: 'button', className: 'dstr-btn', onClick: refreshStatus }, '重新检测')
+				);
+			}
+			if (!status.installed) {
+				var command = 'ollama pull ' + status.model;
+				return h(
+					'div',
+					{ className: 'dstr-notice warn' },
+					h('span', { className: 'dstr-notice-main' }, '本地还没有翻译模型 ' + status.model),
+					h('code', { className: 'dstr-code' }, command),
+					h(
+						'button',
+						{
+							type: 'button',
+							className: 'dstr-btn',
+							onClick: function () {
+								copyText(command).then(function (ok) {
+									toast(ok ? '命令已复制，去终端执行' : '复制失败，请手动复制');
+								});
+							}
+						},
+						'复制命令'
+					),
+					h('span', { className: 'dstr-hint' }, '或在「设置 → 模型」里换成本机已装的模型。'),
+					h('span', { className: 'dstr-spacer' }),
+					h('button', { type: 'button', className: 'dstr-btn', onClick: refreshStatus }, '重新检测')
+				);
+			}
+			return null;
+		}
+
 		function Workbench() {
 			var s = useStore();
 			var tab = s.activeTab || 'text';
@@ -1251,6 +1317,7 @@ window.__ModuleLoader__.load({
 							: h('button', { type: 'button', className: 'dstr-btn', onClick: loadModel }, '加载模型')
 					)
 				),
+				h(SetupNotice, null),
 				h('div', { className: 'dstr-tabs' }, tabButton('text', '文本'), tabButton('file', '文件'), tabButton('settings', '设置')),
 				h('div', { className: 'dstr-body' }, tab === 'text' ? h(TextTab, null) : tab === 'file' ? h(FileTab, null) : h(SettingsTab, null))
 			);
@@ -2125,6 +2192,7 @@ window.__ModuleLoader__.load({
 				Workbench: Workbench,
 				TextTab: TextTab,
 				FileTab: FileTab,
+				SetupNotice: SetupNotice,
 				SettingsTab: SettingsTab,
 				SelectionPopover: SelectionPopover,
 				SelectionBridge: SelectionBridge,

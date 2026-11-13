@@ -202,6 +202,19 @@ self.store.selection = null
 self.store.overlayOpen = true
 render('OverlayWorkbench', () => components.OverlayWorkbench())
 
+// 首次使用提示：连不上 Ollama / 缺模型 都要能渲染出来
+self.store.status = { ...self.store.status, reachable: false, baseURL: 'http://127.0.0.1:11434' }
+const offlineNotice = render('SetupNotice（Ollama 未启动）', () => components.SetupNotice())
+check('未启动 Ollama 时给出提示', !!findNode(offlineNotice, (node) => node.children.indexOf('重新检测') >= 0))
+self.store.status = { ...self.store.status, reachable: true, installed: false, model: 'kaelri/hy-mt2:1.8b' }
+const modelNotice = render('SetupNotice（缺模型）', () => components.SetupNotice())
+check(
+  '缺模型时给出 pull 命令',
+  !!findNode(modelNotice, (node) => node.type === 'code' && String(node.children[0] || '').includes('ollama pull'))
+)
+self.store.status = { ...self.store.status, installed: true }
+check('一切就绪时不渲染提示', components.SetupNotice() === null)
+
 function findNode(root, predicate) {
   if (!root || typeof root !== 'object') return null
   if (predicate(root)) return root
