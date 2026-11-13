@@ -24,7 +24,7 @@
 
 import { inflateRawSync } from 'node:zlib'
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -561,6 +561,27 @@ export function extractText({ name, bytes }) {
 /** 外部划译伴生进程（Windows PowerShell 5.1，零外部依赖）。 */
 export const HELPER_FILE = join(dirname(fileURLToPath(import.meta.url)), 'helper', 'dsh-translate-capture.ps1')
 export const HELPER_LOG = join(tmpdir(), 'dsh-translate-capture.log')
+/** 客户端把 DSH 的主题 token 写在这里，伴生进程照着画浮窗（跟随亮/暗主题与字体）。 */
+export const HELPER_THEME = join(tmpdir(), 'dsh-translate-theme.json')
+
+const THEME_KEYS = ['bgBase', 'bgLayer1', 'bgLayer2', 'bgOverlay', 'borderL1', 'borderL2', 'labelPrimary', 'labelSecondary', 'brandPrimary', 'fontFamily']
+
+/** 把客户端采到的 token 落盘（只收已知键、限长，避免把任意字符串写进磁盘）。 */
+export function writeTheme(theme) {
+  if (!theme || typeof theme !== 'object') return null
+  const safe = {}
+  for (const key of THEME_KEYS) {
+    const value = theme[key]
+    if (typeof value === 'string' && value.trim() && value.length <= 400) safe[key] = value.trim()
+  }
+  if (Object.keys(safe).length === 0) return null
+  try {
+    writeFileSync(HELPER_THEME, JSON.stringify(safe), 'utf8')
+    return HELPER_THEME
+  } catch (error) {
+    return null
+  }
+}
 
 /** 外部划译的默认端口（真正用哪个由客户端从 location.port 传进来）。 */
 const FALLBACK_PORT = 61213
@@ -709,6 +730,8 @@ function helperCommand(port, target, tone) {
       String(process.pid),
       '-LogPath',
       HELPER_LOG,
+      '-ThemePath',
+      HELPER_THEME,
     ],
   }
 }
@@ -729,6 +752,8 @@ export function externalSnapshot(state) {
     helperExists: existsSync(HELPER_FILE),
     helperPath: HELPER_FILE,
     logPath: HELPER_LOG,
+    themePath: HELPER_THEME,
+    themeExists: existsSync(HELPER_THEME),
     diag: { ...state.diag },
   }
 }
@@ -768,6 +793,7 @@ function startExternal(state, body) {
   const port = Number(state.webPort) || Number(body.port) || FALLBACK_PORT
   if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new TranslateError('BAD_REQUEST', '端口不合法')
   const cfg = applyOverrides(state, body)
+  if (body.theme) writeTheme(body.theme)
   const target = typeof body.targetLanguage === 'string' && body.targetLanguage ? body.targetLanguage : cfg.defaultTarget
   const tone = TONES[body.tone] ? body.tone : cfg.tone
   const ext = state.external
@@ -1080,6 +1106,11 @@ async function handleAction(state, body, signal) {
   if (action === 'externalStop') {
     stopExternal(state)
     return { ok: true, external: externalSnapshot(state) }
+  }
+
+  if (action === 'externalTheme') {
+    const path = writeTheme(body.theme)
+    return { ok: true, themePath: path, external: externalSnapshot(state) }
   }
 
   if (action === 'externalStatus') {

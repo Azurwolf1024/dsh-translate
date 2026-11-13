@@ -357,6 +357,75 @@ window.__ModuleLoader__.load({
 			}
 		}
 
+		/** 主题 token 可能挂在 html / body / #root / 主题容器上：挨个找，谁有就用谁。 */
+		function themeRoots() {
+			var roots = [];
+			function add(node) {
+				if (node && roots.indexOf(node) < 0) roots.push(node);
+			}
+			try {
+				add(document.documentElement);
+			} catch (error) { /* ignore */ }
+			try {
+				add(document.body);
+			} catch (error) { /* ignore */ }
+			try {
+				add(document.getElementById('root'));
+			} catch (error) { /* ignore */ }
+			try {
+				var nodes = document.querySelectorAll('[class*="theme"], [data-theme], [data-dsw-theme]');
+				for (var index = 0; index < Math.min(nodes.length, 4); index += 1) add(nodes[index]);
+			} catch (error) { /* ignore */ }
+			return roots;
+		}
+
+		/** 从 CSS 字体栈里挑一个 Windows 上真有的字体（原生窗口只认字体族名）。 */
+		function pickFontFamily(stack) {
+			var preferred = ['Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI Variable', 'Arial'];
+			var names = String(stack || '').split(',').map(function (name) {
+				return name.trim().replace(/^["']|["']$/g, '');
+			});
+			for (var index = 0; index < preferred.length; index += 1) {
+				if (names.indexOf(preferred[index]) >= 0) return preferred[index];
+			}
+			for (var other = 0; other < names.length; other += 1) {
+				if (names[other] && names[other] !== 'system-ui' && names[other] !== 'sans-serif') return names[other];
+			}
+			return 'Microsoft YaHei UI';
+		}
+
+		/** 把 DSH 的主题 token 带上，原生浮窗才能跟页面同色同字体。 */
+		function currentTheme() {
+			try {
+				var styles = themeRoots().map(function (node) {
+					return window.getComputedStyle(node);
+				});
+				function token(name) {
+					for (var index = 0; index < styles.length; index += 1) {
+						var value = styles[index].getPropertyValue(name);
+						if (value && value.trim()) return value.trim();
+					}
+					return '';
+				}
+				var theme = {
+					bgBase: token('--dsw-alias-bg-base'),
+					bgLayer1: token('--dsw-alias-bg-layer-1'),
+					bgLayer2: token('--dsw-alias-bg-layer-2'),
+					bgOverlay: token('--dsw-alias-bg-overlay'),
+					borderL1: token('--dsw-alias-border-l1'),
+					borderL2: token('--dsw-alias-border-l2'),
+					labelPrimary: token('--dsw-alias-label-primary'),
+					labelSecondary: token('--dsw-alias-label-secondary'),
+					brandPrimary: token('--dsw-alias-brand-primary'),
+					fontFamily: pickFontFamily(styles.length ? styles[styles.length - 1].fontFamily : '')
+				};
+				if (!theme.fontFamily) theme.fontFamily = 'Microsoft YaHei UI';
+				return theme;
+			} catch (error) {
+				return null;
+			}
+		}
+
 		var externalInFlight = null;
 
 		async function refreshExternal() {
@@ -375,7 +444,8 @@ window.__ModuleLoader__.load({
 			externalInFlight = api('externalStart', {
 				port: apiPort(),
 				targetLanguage: store.settings.targetLanguage,
-				tone: store.settings.tone
+				tone: store.settings.tone,
+				theme: currentTheme()
 			})
 				.then(function (data) {
 					patch({ external: data.external });
@@ -540,10 +610,27 @@ window.__ModuleLoader__.load({
 							}
 						});
 					}, 12000);
+					// 亮/暗主题或字体变化：把 token 推过去，浮窗下次出现就是新配色
+					var observer = null;
+					var themeTimer = null;
+					try {
+						observer = new window.MutationObserver(function () {
+							if (disposed) return;
+							if (themeTimer) window.clearTimeout(themeTimer);
+							themeTimer = window.setTimeout(function () {
+								if (disposed) return;
+								api('externalTheme', { theme: currentTheme() }).catch(function () {});
+							}, 300);
+						});
+						observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'style', 'data-theme'] });
+					} catch (error) {
+						observer = null;
+					}
 					return function () {
 						disposed = true;
 						if (poll) window.clearInterval(poll);
 						if (retry) window.clearTimeout(retry);
+						if (observer) observer.disconnect();
 						stopExternal();
 					};
 				},

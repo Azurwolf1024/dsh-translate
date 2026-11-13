@@ -5,22 +5,16 @@
 #   → 读不到才注入一次 Ctrl+C 读剪贴板（带扫描码；读完还原）
 #   → POST 到 DSH 的 /dsh-translate/api → 光标旁原生置顶浮窗显示译文。
 #
-# 纪律：
-#   · 不装任何运行时、不起浏览器：UIA 走 .NET 托管 API，浮窗走 WinForms。
-#   · 剪贴板是用户的：只在 UIA 读不到时注入，注入前保存、读完还原；终端窗口一律跳过。
-#   · 一次手势只翻一次；同一段文字 5 秒内不重复翻。
-#   · 进程随 DSH 走：-ParentPid 指定的进程没了就自己退出；DSH 也会在插件卸载时杀掉本进程。
+# 浮窗视觉照 DSH 内页浮层（.dstr-pop）：400 DIP 宽 / 12px 圆角 / 卡片底色 / 标题栏 /
+# 原文（灰、两行、虚线）/ 译文（13px、可滚动）/ 底栏（耗时 + 复制 + 关闭）。
+# 颜色与字体由 DSH 客户端把主题 token 写进 -ThemePath（跟随亮/暗主题）。
+# 想自己看效果：-TestOverlay 会画一帧并截图到 -ShotPath。
 #
-# 参数：
-#   -Port         DSH Web 端口（默认 61213）
-#   -Target       目标语言（auto / zh-Hans / zh-Hant / en / ja ...）
-#   -Tone         语气（natural / literal / casual / formal / business）
-#   -ParentPid    宿主进程 PID（看门狗用，0 = 不监控）
-#   -PollMs       鼠标轮询间隔（默认 45ms）
-#   -MaxChars     单次选区字符上限（默认 4000）
-#   -LogPath      日志文件
-#   -SelfTest     自检：装配 UIA/HTTP/窗口，跑一次真实翻译后退出（不装 UI 循环）
-#   -NoUi         只取词不弹窗（排障用）
+# 纪律：
+#   · 不装运行时、不起浏览器：UIA 走 .NET 托管 API，浮窗走 WinForms 自绘。
+#   · 剪贴板是用户的：只在 UIA 读不到时注入，注入前保存、读到文字后还原；终端窗口跳过。
+#   · 一次手势只翻一次；同一段文字 5 秒内不重复翻；拖窗口/旧选区不误翻。
+#   · 进程随 DSH 走：-ParentPid 指定的进程没了就自己退出；DSH 也会在插件卸载时杀掉本进程。
 
 param(
     [int]$Port = 61213,
@@ -30,6 +24,8 @@ param(
     [int]$PollMs = 45,
     [int]$MaxChars = 4000,
     [string]$LogPath = "$env:TEMP\dsh-translate-capture.log",
+    [string]$ThemePath = '',
+    [string]$ShotPath = "$env:TEMP\dsh-translate-overlay.png",
     [switch]$SelfTest,
     [switch]$Probe,
     [switch]$TestOverlay,
@@ -37,7 +33,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '1.1.0'
+$script:ScriptVersion = '1.2.0'
+$script:ThemePath = $ThemePath
 
 # ───────────────────────────── 日志 ─────────────────────────────
 
@@ -53,10 +50,12 @@ function Write-Log([string]$message) {
 
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase, System.Windows.Forms, System.Drawing, System.Net.Http
 
+$uiRefs = @([System.Windows.Forms.Form].Assembly.Location, [System.Drawing.Color].Assembly.Location)
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Windows.Forms;
 
 public static class DTWin32 {
     [StructLayout(LayoutKind.Sequential)]
@@ -77,8 +76,32 @@ public static class DTWin32 {
     [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint code, uint mapType);
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern uint GetDpiForSystem();
 }
-'@
+
+/** 无边框卡片窗口：CS_DROPSHADOW 让 DWM 给一层系统阴影，双缓冲避免自绘闪烁。 */
+public class DtCard : Form {
+    public DtCard() {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
+        this.DoubleBuffered = true;
+    }
+    protected override CreateParams CreateParams {
+        get {
+            CreateParams cp = base.CreateParams;
+            cp.ClassStyle |= 0x20000; // CS_DROPSHADOW
+            return cp;
+        }
+    }
+}
+
+/** 双缓冲的正文面板：自绘换行文本、自己处理滚轮，不出现原生滚动条。 */
+public class DtPanel : Panel {
+    public DtPanel() {
+        this.DoubleBuffered = true;
+        this.SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
+    }
+}
+'@ -ReferencedAssemblies $uiRefs
 
 [void][DTWin32]::SetProcessDPIAware()
 
@@ -88,7 +111,7 @@ $script:ApiUrl = "http://127.0.0.1:$Port/dsh-translate/api"
 $script:Http = New-Object System.Net.Http.HttpClient
 $script:Http.Timeout = [TimeSpan]::FromSeconds(120)
 $script:Task = $null
-$script:PendingText = ''
+$script:TaskAt = 0
 $script:LastText = ''
 $script:LastTextAt = 0
 $script:LeftDown = $false
@@ -98,9 +121,20 @@ $script:LastClickAt = 0
 $script:LastClickPoint = $null
 $script:Overlay = $null
 $script:BodyBox = $null
-$script:TitleLabel = $null
+$script:Layout = $null
+$script:TextBody = ''
+$script:BodyTextHeight = 0
+$script:BodyMaxScroll = 0
+$script:BodyLineHeight = 16
+$script:ScrollOffset = 0
+$script:LastSource = ''
+$script:TitleText = ''
+$script:SourceText = ''
+$script:MetaText = ''
+$script:Theme = $null
+$script:ThemeAt = [DateTime]::MinValue
+$script:Scale = 1.0
 $script:HiddenAt = 0
-$script:BusySince = 0
 $script:TerminalClasses = @('ConsoleWindowClass', 'CASCADIA_HOSTING_WINDOW_CLASS', 'mintty', 'PseudoConsoleWindow', 'PuTTY')
 
 # ───────────────────────────── 工具 ─────────────────────────────
@@ -117,10 +151,6 @@ function Get-WindowTitle([IntPtr]$hwnd) {
     return $sb.ToString()
 }
 
-function Get-TopLevelWindow([IntPtr]$hwnd) {
-    return [DTWin32]::GetAncestor($hwnd, 2) # GA_ROOT
-}
-
 function Get-ProcessNameOfWindow([IntPtr]$hwnd) {
     try {
         $pid32 = [uint32]0
@@ -128,6 +158,170 @@ function Get-ProcessNameOfWindow([IntPtr]$hwnd) {
         if ($pid32 -eq 0) { return '' }
         return (Get-Process -Id $pid32 -ErrorAction SilentlyContinue).ProcessName
     } catch { return '' }
+}
+
+# ───────────────────────────── 主题 ─────────────────────────────
+
+function Get-IsDarkTheme() {
+    try {
+        $value = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name 'AppsUseLightTheme' -ErrorAction Stop
+        return ($value.AppsUseLightTheme -eq 0)
+    } catch { return $false }
+}
+
+function Parse-Color([string]$text, [System.Drawing.Color]$fallback) {
+    if (-not $text) { return $fallback }
+    $value = $text.Trim()
+    $m = [regex]::Match($value, 'rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)')
+    if ($m.Success) {
+        return [System.Drawing.Color]::FromArgb([int]$m.Groups[1].Value, [int]$m.Groups[2].Value, [int]$m.Groups[3].Value)
+    }
+    if ($value -match '^#([0-9a-fA-F]{8})$') {
+        $hex = $value.Substring(1, 6)
+        return [System.Drawing.Color]::FromArgb(
+            [Convert]::ToInt32($hex.Substring(0, 2), 16),
+            [Convert]::ToInt32($hex.Substring(2, 2), 16),
+            [Convert]::ToInt32($hex.Substring(4, 2), 16))
+    }
+    if ($value -match '^#([0-9a-fA-F]{6})$') {
+        $hex = $value.Substring(1)
+        return [System.Drawing.Color]::FromArgb(
+            [Convert]::ToInt32($hex.Substring(0, 2), 16),
+            [Convert]::ToInt32($hex.Substring(2, 2), 16),
+            [Convert]::ToInt32($hex.Substring(4, 2), 16))
+    }
+    if ($value -match '^#([0-9a-fA-F]{3})$') {
+        $hex = $value.Substring(1)
+        return [System.Drawing.Color]::FromArgb(
+            [Convert]::ToInt32(('' + $hex[0] + $hex[0]), 16),
+            [Convert]::ToInt32(('' + $hex[1] + $hex[1]), 16),
+            [Convert]::ToInt32(('' + $hex[2] + $hex[2]), 16))
+    }
+    return $fallback
+}
+
+# 原生窗口只认字体族名：挑一个本机真装了的，避免 New-Object Font 直接抛。
+# 主题 token 可能是带 alpha 的（DSH 的 --dsw-alias-* 有 #ffffff0f 这种写法）：
+# 原生窗口没有 alpha 合成，先把 token 按 alpha 混到实底上，视觉才和页面一致。
+function Get-ColorAlpha([string]$text) {
+    if (-not $text) { return 1.0 }
+    $value = $text.Trim()
+    if ($value -match '^#[0-9a-fA-F]{8}$') { return [Convert]::ToInt32($value.Substring(7, 2), 16) / 255.0 }
+    if ($value -match '^#[0-9a-fA-F]{4}$') { return [Convert]::ToInt32(('' + $value[4] + $value[4]), 16) / 255.0 }
+    $m = [regex]::Match($value, 'rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*([0-9.]+)\s*\)')
+    if ($m.Success) { return [double]$m.Groups[1].Value }
+    return 1.0
+}
+
+function Blend-Color([System.Drawing.Color]$color, [double]$alpha, [System.Drawing.Color]$backdrop) {
+    if ($alpha -ge 1.0) { return $color }
+    if ($alpha -le 0.0) { return $backdrop }
+    $r = [int][Math]::Round(($color.R * $alpha) + ($backdrop.R * (1 - $alpha)))
+    $g = [int][Math]::Round(($color.G * $alpha) + ($backdrop.G * (1 - $alpha)))
+    $b = [int][Math]::Round(($color.B * $alpha) + ($backdrop.B * (1 - $alpha)))
+    return [System.Drawing.Color]::FromArgb($r, $g, $b)
+}
+
+function Resolve-FontFamily([string]$stack) {
+    $candidates = @()
+    foreach ($part in ([string]$stack).Split(',')) {
+        $name = $part.Trim().Trim('"', "'")
+        if ($name -and $name -notmatch '^(system-ui|sans-serif|serif|monospace|ui-sans-serif|-apple-system|BlinkMacSystemFont)$') {
+            $candidates += $name
+        }
+    }
+    $candidates += @('Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI', 'Arial')
+    try {
+        $installed = @{}
+        foreach ($family in [System.Drawing.FontFamily]::Families) { $installed[$family.Name] = $true }
+        foreach ($candidate in $candidates) {
+            if ($installed.ContainsKey($candidate)) { return $candidate }
+        }
+    } catch { }
+    return 'Microsoft YaHei UI'
+}
+
+function Get-Theme() {
+    $dark = @{
+        bg             = [System.Drawing.Color]::FromArgb(36, 39, 46)
+        layer1         = [System.Drawing.Color]::FromArgb(44, 48, 58)
+        border         = [System.Drawing.Color]::FromArgb(58, 63, 75)
+        labelPrimary   = [System.Drawing.Color]::FromArgb(230, 233, 240)
+        labelSecondary = [System.Drawing.Color]::FromArgb(154, 163, 178)
+        brand          = [System.Drawing.Color]::FromArgb(77, 107, 254)
+        fontFamily     = 'Microsoft YaHei UI'
+    }
+    $light = @{
+        bg             = [System.Drawing.Color]::FromArgb(252, 252, 253)
+        layer1         = [System.Drawing.Color]::FromArgb(243, 245, 248)
+        border         = [System.Drawing.Color]::FromArgb(227, 230, 235)
+        labelPrimary   = [System.Drawing.Color]::FromArgb(28, 32, 40)
+        labelSecondary = [System.Drawing.Color]::FromArgb(110, 118, 132)
+        brand          = [System.Drawing.Color]::FromArgb(47, 111, 235)
+        fontFamily     = 'Microsoft YaHei UI'
+    }
+    $base = @{}
+    $src = if (Get-IsDarkTheme) { $dark } else { $light }
+    foreach ($key in $src.Keys) { $base[$key] = $src[$key] }
+
+    if ($script:ThemePath -and (Test-Path $script:ThemePath)) {
+        try {
+            $raw = Get-Content -Path $script:ThemePath -Raw -Encoding UTF8
+            if ($raw) {
+                $t = $raw | ConvertFrom-Json
+                $solid = $base.bg
+                if ($t.bgBase) { $solid = Parse-Color $t.bgBase $solid }
+                if ($t.bgOverlay) {
+                    $alpha = Get-ColorAlpha $t.bgOverlay
+                    $base.bg = Blend-Color (Parse-Color $t.bgOverlay $solid) $alpha $solid
+                } elseif ($t.bgLayer1) {
+                    $base.bg = Parse-Color $t.bgLayer1 $solid
+                } else {
+                    $base.bg = $solid
+                }
+                if ($t.bgLayer1) {
+                    $layerAlpha = Get-ColorAlpha $t.bgLayer1
+                    $base.layer1 = Blend-Color (Parse-Color $t.bgLayer1 $base.bg) $layerAlpha $base.bg
+                } elseif ($t.bgLayer2) {
+                    $layerAlpha = Get-ColorAlpha $t.bgLayer2
+                    $base.layer1 = Blend-Color (Parse-Color $t.bgLayer2 $base.bg) $layerAlpha $base.bg
+                }
+                if ($t.borderL2) {
+                    $borderAlpha = Get-ColorAlpha $t.borderL2
+                    $base.border = Blend-Color (Parse-Color $t.borderL2 $base.bg) $borderAlpha $base.bg
+                } elseif ($t.borderL1) {
+                    $borderAlpha = Get-ColorAlpha $t.borderL1
+                    $base.border = Blend-Color (Parse-Color $t.borderL1 $base.bg) $borderAlpha $base.bg
+                }
+                if ($t.labelPrimary) { $base.labelPrimary = Parse-Color $t.labelPrimary $base.labelPrimary }
+                if ($t.labelSecondary) { $base.labelSecondary = Parse-Color $t.labelSecondary $base.labelSecondary }
+                if ($t.brandPrimary) { $base.brand = Parse-Color $t.brandPrimary $base.brand }
+                if ($t.fontFamily) {
+                    $resolved = Resolve-FontFamily ([string]$t.fontFamily)
+                    if ($resolved) { $base.fontFamily = $resolved }
+                }
+            }
+        } catch { }
+    }
+    return $base
+}
+
+function Update-Theme {
+    $now = Get-Date
+    if ($script:Theme -and ($now - $script:ThemeAt).TotalSeconds -lt 1) { return }
+    $script:Theme = Get-Theme
+    $script:ThemeAt = $now
+    $script:FontTitle = New-Object System.Drawing.Font($script:Theme.fontFamily, [single]12, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+    $script:FontBody = New-Object System.Drawing.Font($script:Theme.fontFamily, [single]13, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+    $script:FontSmall = New-Object System.Drawing.Font($script:Theme.fontFamily, [single]11, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+}
+
+function Get-UiScale() {
+    try {
+        $dpi = [DTWin32]::GetDpiForSystem()
+        if ($dpi -gt 0) { return $dpi / 96.0 }
+    } catch { }
+    return 1.0
 }
 
 # ───────────────────────────── 取词：UIA 优先 ─────────────────────────────
@@ -142,7 +336,7 @@ function Convert-Rects([double[]]$flat) {
 }
 
 function Test-PointNearRects([int]$x, [int]$y, $rects) {
-    if (-not $rects -or $rects.Count -eq 0) { return $true }   # 拿不到矩形就不挡
+    if (-not $rects -or $rects.Count -eq 0) { return $true }
     foreach ($r in $rects) {
         $h = [Math]::Max(1, $r.bottom - $r.top)
         $margin = [Math]::Max(8, $h)
@@ -205,19 +399,18 @@ function Get-SelectionViaUia([System.Windows.Point]$point) {
 function Send-CtrlC() {
     $scanC = [byte][DTWin32]::MapVirtualKey(0x43, 0)
     $scanCtrl = [byte][DTWin32]::MapVirtualKey(0x11, 0)
-    [DTWin32]::keybd_event(0x11, $scanCtrl, 0, [UIntPtr]::Zero)       # Ctrl down
+    [DTWin32]::keybd_event(0x11, $scanCtrl, 0, [UIntPtr]::Zero)
     Start-Sleep -Milliseconds 12
-    [DTWin32]::keybd_event(0x43, $scanC, 0, [UIntPtr]::Zero)          # C down
+    [DTWin32]::keybd_event(0x43, $scanC, 0, [UIntPtr]::Zero)
     Start-Sleep -Milliseconds 12
-    [DTWin32]::keybd_event(0x43, $scanC, 2, [UIntPtr]::Zero)          # C up
+    [DTWin32]::keybd_event(0x43, $scanC, 2, [UIntPtr]::Zero)
     Start-Sleep -Milliseconds 12
-    [DTWin32]::keybd_event(0x11, $scanCtrl, 2, [UIntPtr]::Zero)       # Ctrl up
+    [DTWin32]::keybd_event(0x11, $scanCtrl, 2, [UIntPtr]::Zero)
 }
 
 function Get-SelectionViaClipboard([IntPtr]$hwnd) {
     $class = Get-WindowClass $hwnd
     if ($script:TerminalClasses -contains $class) { return '' }
-    # 用户此刻正按着 Ctrl 就别注入（会拆散用户自己的组合键）
     if (([DTWin32]::GetAsyncKeyState(0x11) -band 0x8000) -ne 0) { return '' }
 
     $saved = $null
@@ -238,10 +431,7 @@ function Get-SelectionViaClipboard([IntPtr]$hwnd) {
         }
     }
 
-    # 注入后拿到的还是注入前那段文字 → 这次手势没有复制出新内容，当作没选中
     if ($text -and $beforeText -and $text -eq $beforeText) { $text = '' }
-
-    # 还原用户原来的剪贴板（只在真的读到文字时还原；没读到就不碰）
     if ($text -and $saved) {
         try { [System.Windows.Forms.Clipboard]::SetDataObject($saved, $true) } catch { }
     }
@@ -250,94 +440,147 @@ function Get-SelectionViaClipboard([IntPtr]$hwnd) {
 
 # ───────────────────────────── 浮窗 ─────────────────────────────
 
-function Get-IsDarkTheme() {
-    try {
-        $value = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name 'AppsUseLightTheme' -ErrorAction Stop
-        return ($value.AppsUseLightTheme -eq 0)
-    } catch { return $false }
+function New-RoundedPath([System.Drawing.RectangleF]$rect, [single]$radius) {
+    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $d = $radius * 2
+    if ($d -le 1) { $path.AddRectangle($rect); return $path }
+    $path.AddArc($rect.X, $rect.Y, $d, $d, 180, 90)
+    $path.AddArc(($rect.Right - $d), $rect.Y, $d, $d, 270, 90)
+    $path.AddArc(($rect.Right - $d), ($rect.Bottom - $d), $d, $d, 0, 90)
+    $path.AddArc($rect.X, ($rect.Bottom - $d), $d, $d, 90, 90)
+    $path.CloseFigure()
+    return $path
+}
+
+function Measure-WrappedHeight([System.Drawing.Graphics]$graphics, [string]$text, [System.Drawing.Font]$font, [int]$width) {
+    if (-not $text) { return 0 }
+    $format = New-Object System.Drawing.StringFormat
+    $size = $graphics.MeasureString($text, $font, $width, $format)
+    return [int][Math]::Ceiling($size.Height)
+}
+
+function Get-LineHeight([System.Drawing.Graphics]$graphics, [System.Drawing.Font]$font) {
+    return [single][Math]::Ceiling($font.GetHeight($graphics))
 }
 
 function Ensure-Overlay() {
     if ($script:Overlay -and -not $script:Overlay.IsDisposed) { return $script:Overlay }
+    Update-Theme
 
-    $form = New-Object System.Windows.Forms.Form
+    $form = New-Object DtCard
     $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
     $form.ShowInTaskbar = $false
     $form.TopMost = $true
-    $form.Width = 440
-    $form.Height = 132
-    $form.Padding = New-Object System.Windows.Forms.Padding(0)
     $form.KeyPreview = $true
+    $form.BackColor = $script:Theme.bg
+    $form.Width = 400
+    $form.Height = 180
 
-    $dark = Get-IsDarkTheme
-    $bg = if ($dark) { [System.Drawing.Color]::FromArgb(32, 36, 48) } else { [System.Drawing.Color]::FromArgb(252, 252, 253) }
-    $fg = if ($dark) { [System.Drawing.Color]::FromArgb(232, 235, 244) } else { [System.Drawing.Color]::FromArgb(28, 32, 40) }
-    $muted = if ($dark) { [System.Drawing.Color]::FromArgb(150, 160, 180) } else { [System.Drawing.Color]::FromArgb(110, 118, 132) }
-    $form.BackColor = $bg
-
-    $title = New-Object System.Windows.Forms.Label
-    $title.AutoSize = $false
-    $title.Location = New-Object System.Drawing.Point(12, 8)
-    $title.Size = New-Object System.Drawing.Size(416, 20)
-    $title.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Regular)
-    $title.ForeColor = $muted
-    $title.Text = '翻译'
-    $form.Controls.Add($title)
-
-    $body = New-Object System.Windows.Forms.TextBox
-    $body.Multiline = $true
-    $body.ReadOnly = $true
-    $body.BorderStyle = [System.Windows.Forms.BorderStyle]::None
-    $body.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
-    $body.WordWrap = $true
-    $body.BackColor = $bg
-    $body.ForeColor = $fg
-    $body.Location = New-Object System.Drawing.Point(12, 32)
-    $body.Size = New-Object System.Drawing.Size(416, 62)
-    $body.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11, [System.Drawing.FontStyle]::Regular)
-    $body.Text = ''
+    $body = New-Object DtPanel
+    $body.BackColor = $script:Theme.bg
+    $body.TabStop = $false
+    $body.Add_Paint({
+        param($sender, $event)
+        if (-not $script:TextBody) { return }
+        $g = $event.Graphics
+        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+        $format = New-Object System.Drawing.StringFormat
+        $brush = New-Object System.Drawing.SolidBrush($script:Theme.labelPrimary)
+        $rect = New-Object System.Drawing.RectangleF(0, (-1 * $script:ScrollOffset), ([single]$sender.Width), ([single]($script:BodyTextHeight + 40)))
+        $g.DrawString($script:TextBody, $script:FontBody, $brush, $rect, $format)
+        $brush.Dispose()
+    })
+    $body.Add_MouseWheel({
+        param($sender, $event)
+        if ($script:BodyMaxScroll -le 0) { return }
+        $step = [Math]::Max(1, ($script:BodyLineHeight * 1.2))
+        $script:ScrollOffset = [Math]::Min($script:BodyMaxScroll, [Math]::Max(0, ($script:ScrollOffset - ($event.Delta / 120) * $step)))
+        $sender.Invalidate()
+    })
     $form.Controls.Add($body)
 
-    $close = New-Object System.Windows.Forms.Button
-    $close.Text = '复制'
-    $close.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $close.FlatAppearance.BorderSize = 0
-    $close.ForeColor = $muted
-    $close.BackColor = $bg
-    $close.Location = New-Object System.Drawing.Point(336, 100)
-    $close.Size = New-Object System.Drawing.Size(44, 24)
-    $close.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
-    $close.Add_Click({
-        try {
-            if ($script:BodyBox.Text) { [System.Windows.Forms.Clipboard]::SetText($script:BodyBox.Text) }
-        } catch { }
-    })
-    $form.Controls.Add($close)
+    $form.Add_Paint({
+        param($sender, $e)
+        $layout = $script:Layout
+        if (-not $layout) { return }
+        $g = $e.Graphics
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+        $scale = $script:Scale
+        $pad = 14 * $scale
+        $rect = New-Object System.Drawing.RectangleF(0, 0, ($sender.Width - 0.5), ($sender.Height - 0.5))
+        $path = New-RoundedPath $rect ([single](12 * $scale))
+        $bgBrush = New-Object System.Drawing.SolidBrush($script:Theme.bg)
+        $g.FillPath($bgBrush, $path)
+        $borderPen = New-Object System.Drawing.Pen($script:Theme.border, 1)
+        $g.DrawPath($borderPen, $path)
 
-    $dismiss = New-Object System.Windows.Forms.Button
-    $dismiss.Text = '关闭  Esc'
-    $dismiss.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $dismiss.FlatAppearance.BorderSize = 0
-    $dismiss.ForeColor = $muted
-    $dismiss.BackColor = $bg
-    $dismiss.Location = New-Object System.Drawing.Point(384, 100)
-    $dismiss.Size = New-Object System.Drawing.Size(46, 24)
-    $dismiss.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8)
-    $dismiss.Add_Click({ Hide-Overlay })
-    $form.Controls.Add($dismiss)
+        $muted = New-Object System.Drawing.SolidBrush($script:Theme.labelSecondary)
+        $titleFormat = New-Object System.Drawing.StringFormat
+        $titleFormat.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+        $g.DrawString($script:TitleText, $script:FontTitle, $muted, [single]$pad, [single]$layout.headerY, $titleFormat)
 
-    $form.Add_KeyDown({
-        param($sender, $event)
-        if ($event.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { Hide-Overlay; $event.Handled = $true }
+        $closeFormat = New-Object System.Drawing.StringFormat
+        $closeFormat.Alignment = [System.Drawing.StringAlignment]::Far
+        $closeFormat.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+        $g.DrawString('✕', $script:FontTitle, $muted, [single]($sender.Width - $pad - (2 * $scale)), [single]$layout.headerY, $closeFormat)
+
+        if ($layout.sourceH -gt 0 -and $script:SourceText) {
+            $sourceRect = New-Object System.Drawing.RectangleF([single]$pad, [single]$layout.sourceY, [single]($sender.Width - 2 * $pad), [single]$layout.sourceH)
+            $sourceFormat = New-Object System.Drawing.StringFormat
+            $sourceFormat.Trimming = [System.Drawing.StringTrimming]::EllipsisWord
+            $g.DrawString($script:SourceText, $script:FontSmall, $muted, $sourceRect, $sourceFormat)
+            $dashPen = New-Object System.Drawing.Pen($script:Theme.border, 1)
+            $dashPen.DashStyle = [System.Drawing.Drawing2D.DashStyle]::Dot
+            $dashY = [int]($layout.bodyY - (7 * $scale))
+            $g.DrawLine($dashPen, [single]$pad, [single]$dashY, [single]($sender.Width - $pad), [single]$dashY)
+        }
+
+        $footerPen = New-Object System.Drawing.Pen($script:Theme.border, 1)
+        $g.DrawLine($footerPen, [single]0, [single]$layout.headerLineY, [single]$sender.Width, [single]$layout.headerLineY)
+        $g.DrawLine($footerPen, [single]0, [single]$layout.footerLineY, [single]$sender.Width, [single]$layout.footerLineY)
+
+        if ($layout.copyRect.Width -gt 0) {
+            $buttonPath = New-RoundedPath $layout.copyRect ([single](8 * $scale))
+            $buttonBg = New-Object System.Drawing.SolidBrush($script:Theme.layer1)
+            $g.FillPath($buttonBg, $buttonPath)
+            $g.DrawPath($borderPen, $buttonPath)
+            $buttonFormat = New-Object System.Drawing.StringFormat
+            $buttonFormat.Alignment = [System.Drawing.StringAlignment]::Center
+            $buttonFormat.LineAlignment = [System.Drawing.StringAlignment]::Center
+            $strong = New-Object System.Drawing.SolidBrush($script:Theme.labelPrimary)
+            $g.DrawString('复制', $script:FontSmall, $strong, $layout.copyRect, $buttonFormat)
+            $buttonBg.Dispose()
+        }
+
+        $centerFormat = New-Object System.Drawing.StringFormat
+        $centerFormat.Alignment = [System.Drawing.StringAlignment]::Center
+        $centerFormat.LineAlignment = [System.Drawing.StringAlignment]::Center
+        if ($script:LastSource) {
+            $g.DrawString('重译', $script:FontSmall, $muted, $layout.retryRect, $centerFormat)
+        }
+        if ($script:MetaText) {
+            $metaFormat = New-Object System.Drawing.StringFormat
+            $metaFormat.LineAlignment = [System.Drawing.StringAlignment]::Center
+            $metaRect = New-Object System.Drawing.RectangleF([single]$pad, [single]($layout.footerLineY + 2 * $scale), [single](190 * $scale), [single]($layout.footerH - 4 * $scale))
+            $g.DrawString($script:MetaText, $script:FontSmall, $muted, $metaRect, $metaFormat)
+        }
     })
-    $form.Add_Deactivate({ Hide-Overlay })
+
     $form.Add_MouseDown({
         param($sender, $event)
-        if ($event.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
-            $script:DragStart = $event.Location
-            $script:DragOrigin = $sender.Location
+        if ($event.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+        $layout = $script:Layout
+        if (-not $layout) { return }
+        if ($layout.closeRect.Contains($event.Location)) { Hide-Overlay; return }
+        if ($layout.copyRect.Contains($event.Location)) {
+            try { [System.Windows.Forms.Clipboard]::SetText($script:TextBody) } catch { }
+            return
         }
+        if ($layout.retryRect.Contains($event.Location)) { Retry-Translate; return }
+        $script:DragStart = $event.Location
+        $script:DragOrigin = $sender.Location
     })
     $form.Add_MouseMove({
         param($sender, $event)
@@ -348,31 +591,118 @@ function Ensure-Overlay() {
         }
     })
     $form.Add_MouseUp({ $script:DragStart = $null })
+    $form.Add_KeyDown({
+        param($sender, $event)
+        if ($event.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { Hide-Overlay; $event.Handled = $true }
+    })
+    $form.Add_Deactivate({ Hide-Overlay })
 
     $script:Overlay = $form
     $script:BodyBox = $body
-    $script:TitleLabel = $title
     return $form
 }
 
-function Show-Overlay([string]$title, [string]$text, [int]$x, [int]$y) {
+function Update-OverlayLayout([string]$source, [string]$body) {
+    $form = $script:Overlay
+    if (-not $form) { return }
+    $scale = $script:Scale
+    $width = 400 * $scale
+    $pad = 14 * $scale
+    $wrap = $width - 2 * $pad
+    $graphics = $form.CreateGraphics()
+    try {
+        $titleH = [int](Get-LineHeight $graphics $script:FontTitle)
+        $smallH = [int](Get-LineHeight $graphics $script:FontSmall)
+
+        $sourceH = 0
+        if ($source) {
+            $needed = Measure-WrappedHeight $graphics $source $script:FontSmall ([int]$wrap)
+            $sourceH = [Math]::Min([int](2 * $smallH), [Math]::Max([int]$smallH, $needed))
+        }
+        if ($body) {
+            $needed = Measure-WrappedHeight $graphics $body $script:FontBody ([int]$wrap)
+            $script:BodyTextHeight = $needed
+            $bodyH = [Math]::Max([int]($smallH + 2), [Math]::Min([int](300 * $scale), $needed))
+            $script:BodyMaxScroll = [Math]::Max(0, $needed - $bodyH)
+            $script:BodyLineHeight = [int](Get-LineHeight $graphics $script:FontBody)
+        } else {
+            $script:BodyTextHeight = 0
+            $script:BodyMaxScroll = 0
+            $bodyH = [int]($smallH + 2)
+        }
+    } finally {
+        $graphics.Dispose()
+    }
+
+    $headerH = [Math]::Max([int](20 * $scale), $titleH)
+    $gap = [int](9 * $scale)
+    $footerH = [int](30 * $scale)
+    $headerY = [int]$pad
+    $sourceY = $headerY + $headerH
+    $bodyY = $sourceY + $(if ($sourceH -gt 0) { $sourceH + $gap } else { 0 })
+    $footerLineY = $bodyY + $bodyH + $gap
+    $totalH = $footerLineY + $footerH + $pad
+
+    $copyW = [int](46 * $scale)
+    $copyH = [int](22 * $scale)
+    $retryW = [int](40 * $scale)
+    $buttonY = $footerLineY + [int](($footerH - $copyH) / 2)
+    $copyRect = New-Object System.Drawing.RectangleF([single]($width - $pad - $copyW), [single]$buttonY, [single]$copyW, [single]$copyH)
+    $retryRect = New-Object System.Drawing.RectangleF([single]($width - $pad - $copyW - (8 * $scale) - $retryW), [single]$buttonY, [single]$retryW, [single]$copyH)
+    $closeRect = New-Object System.Drawing.RectangleF([single]($width - $pad - (22 * $scale)), [single]($headerY - (2 * $scale)), [single](22 * $scale), [single]$titleH)
+
+    $script:Layout = @{
+        width       = [int]$width
+        height      = [int]$totalH
+        headerY     = $headerY
+        sourceY     = $sourceY
+        sourceH     = $sourceH
+        bodyX       = [int]$pad
+        bodyY       = $bodyY
+        bodyW       = [int]$wrap
+        bodyH       = [int]$bodyH
+        footerLineY = $footerLineY
+        footerH     = $footerH
+        headerLineY = [int]($sourceY - 1)
+        copyRect    = $copyRect
+        retryRect   = $retryRect
+        closeRect   = $closeRect
+    }
+
+    $form.Width = [int]$script:Layout.width
+    $form.Height = [int]$script:Layout.height
+    $script:BodyBox.Location = New-Object System.Drawing.Point([int]$script:Layout.bodyX, [int]$script:Layout.bodyY)
+    $script:BodyBox.Size = New-Object System.Drawing.Size([int]$script:Layout.bodyW, [int]$script:Layout.bodyH)
+    $script:BodyBox.BackColor = $script:Theme.bg
+    $rect = New-Object System.Drawing.RectangleF(0, 0, ($form.Width - 0.5), ($form.Height - 0.5))
+    $path = New-RoundedPath $rect ([single](12 * $scale))
+    if ($form.Region) { $form.Region.Dispose() }
+    $form.Region = New-Object System.Drawing.Region($path)
+    $script:BodyBox.Invalidate()
+}
+
+function Show-Overlay([string]$title, [string]$source, [string]$body, [string]$meta, [int]$x, [int]$y) {
     if ($NoUi) { return }
+    Update-Theme
+    if (-not $script:Scale) { $script:Scale = Get-UiScale }
     $form = Ensure-Overlay
-    $script:TitleLabel.Text = $title
-    $script:BodyBox.Text = $text
-    $lines = 1
-    if ($text) { $lines = ([Math]::Min(9, [Math]::Max(1, [Math]::Ceiling($text.Length / 44)))) }
-    $form.Height = 92 + ($lines * 20)
-    $script:BodyBox.Height = $form.Height - 70
+    $script:TitleText = $title
+    $script:SourceText = $source
+    $script:MetaText = $meta
+    $script:TextBody = $body
+    $script:ScrollOffset = 0
+    Update-OverlayLayout $source $body
 
     $screen = [System.Windows.Forms.Screen]::FromPoint((New-Object System.Drawing.Point($x, $y)))
     $wa = $screen.WorkingArea
-    $left = [Math]::Min([Math]::Max($wa.Left + 8, $x + 14), $wa.Right - $form.Width - 8)
-    $top = $y + 18
-    if ($top + $form.Height -gt $wa.Bottom - 8) { $top = $y - $form.Height - 12 }
-    if ($top -lt $wa.Top + 8) { $top = $wa.Top + 8 }
-    $form.Location = New-Object System.Drawing.Point($left, $top)
-    $form.Show()
+    $left = [Math]::Min([Math]::Max($wa.Left + 10, $x + 14), ($wa.Right - $form.Width - 10))
+    $top = $y + 20
+    if (($top + $form.Height) -gt ($wa.Bottom - 10)) { $top = $y - $form.Height - 14 }
+    if ($top -lt ($wa.Top + 10)) { $top = $wa.Top + 10 }
+    $form.Location = New-Object System.Drawing.Point([int]$left, [int]$top)
+    if (-not $form.Visible) { $form.Show() }
+    $form.Invalidate()
+    $script:BodyBox.Invalidate()
     $form.Activate()
     $script:HiddenAt = 0
 }
@@ -386,6 +716,12 @@ function Hide-Overlay() {
 
 # ───────────────────────────── 翻译 ─────────────────────────────
 
+function Get-Point() {
+    $pos = [DTWin32+POINT]::new()
+    [void][DTWin32]::GetCursorPos([ref]$pos)
+    return $pos
+}
+
 function Start-Translate([string]$text, [int]$x, [int]$y) {
     if ($NoUi) { return }
     $payload = @{
@@ -395,15 +731,23 @@ function Start-Translate([string]$text, [int]$x, [int]$y) {
         tone           = $Tone
     } | ConvertTo-Json -Compress
     $content = New-Object System.Net.Http.StringContent($payload, [System.Text.Encoding]::UTF8, 'application/json')
-    $script:PendingText = $text
+    $preview = $text
+    if ($preview.Length -gt 90) { $preview = $preview.Substring(0, 90) + '…' }
+    $script:LastSource = $text
+    $script:TaskAt = [Environment]::TickCount
     try {
         $script:Task = $script:Http.PostAsync($script:ApiUrl, $content)
+        Show-Overlay '翻译中…' $preview '正在翻译…' '' $x $y
     } catch {
         $script:Task = $null
-        Show-Overlay '翻译失败' ('翻译服务不可用：' + $_.Exception.Message) $x $y
-        return
+        Show-Overlay '翻译失败' $preview ('翻译服务不可用：' + $_.Exception.Message) '' $x $y
     }
-    Show-Overlay ('翻译中… → ' + $Target) $text.Substring(0, [Math]::Min(120, $text.Length)) $x $y
+}
+
+function Retry-Translate() {
+    if (-not $script:LastSource) { return }
+    $pos = Get-Point
+    Start-Translate $script:LastSource $pos.X $pos.Y
 }
 
 function Complete-Translate() {
@@ -411,22 +755,22 @@ function Complete-Translate() {
     $task = $script:Task
     if (-not $task.IsCompleted) { return }
     $script:Task = $null
-    $pos = [DTWin32+POINT]::new()
-    [void][DTWin32]::GetCursorPos([ref]$pos)
+    $pos = Get-Point
+    $preview = $script:SourceText
     try {
         $response = $task.Result
         $body = $response.Content.ReadAsStringAsync().Result
         $json = $body | ConvertFrom-Json
         if ($json.ok -eq $true) {
-            $target = $json.targetLanguage
-            Show-Overlay ('译文 → ' + $target) $json.text $pos.X $pos.Y
+            $meta = ('{0} ms · {1}' -f [int]$json.ms, $json.targetLanguage)
+            Show-Overlay ('→ ' + $json.targetLanguage) $preview $json.text $meta $pos.X $pos.Y
         } elseif ($json.error) {
-            Show-Overlay '翻译失败' $json.error.message $pos.X $pos.Y
+            Show-Overlay '翻译失败' $preview $json.error.message '' $pos.X $pos.Y
         } else {
-            Show-Overlay '翻译失败' ('HTTP ' + [int]$response.StatusCode) $pos.X $pos.Y
+            Show-Overlay '翻译失败' $preview ('HTTP ' + [int]$response.StatusCode) '' $pos.X $pos.Y
         }
     } catch {
-        Show-Overlay '翻译失败' $_.Exception.Message $pos.X $pos.Y
+        Show-Overlay '翻译失败' $preview $_.Exception.Message '' $pos.X $pos.Y
     }
 }
 
@@ -439,14 +783,12 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
 
     $processName = Get-ProcessNameOfWindow $hwnd
     if ($processName -imatch 'dsh-translate-capture') { return }
-    # DSH 自己的窗口交给页面内浮层（否则一次选中弹两个窗）
     if ($processName -imatch '^(DeepSeek Harness|dsh)') { return }
 
     $pointObj = New-Object System.Windows.Point($point.X, $point.Y)
     $text = ''
     $source = 'uia'
     if (-not $script:NoUia) {
-        # 冷启动时 Chromium/WebView2 的无障碍树还没打开：第一次读不到就等 160ms 再读
         for ($attempt = 1; $attempt -le 2; $attempt++) {
             $found = $null
             try { $found = Get-SelectionViaUia $pointObj } catch { $found = $null }
@@ -454,7 +796,6 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
                 $near = (Test-PointNearRects $point.X $point.Y $found.rects)
                 if (-not $near -and $pressPoint) { $near = (Test-PointNearRects $pressPoint.X $pressPoint.Y $found.rects) }
                 if ($near) { $text = $found.text; break }
-                # 选区不在这次手势的落点上：那是上一次留下的旧选区（或拖窗口时读到的残留），不翻
                 Write-Log ("stale selection ignored chars=" + $found.text.Length)
                 return
             }
@@ -479,36 +820,44 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
     Start-Translate $text $point.X $point.Y
 }
 
-# ───────────────────────────── 浮窗冒烟：造一次窗、画一帧、然后退出 ─────────────────────────────
+# ───────────────────────────── 浮窗冒烟（画一帧 + 截图） ─────────────────────────────
 
 if ($TestOverlay) {
-    $ok = $false
-    $err = ''
+    $result = @{ ok = $false; error = ''; shot = ''; size = '' }
     try {
-        $pt = [DTWin32+POINT]::new()
-        [void][DTWin32]::GetCursorPos([ref]$pt)
-        Show-Overlay '译文 → 简体中文' '这是一条浮窗冒烟测试：能看到这行字就说明原生置顶窗口正常。' $pt.X $pt.Y
-        $deadline = [Environment]::TickCount + 2500
-        while ([Environment]::TickCount -lt $deadline) {
-            [System.Windows.Forms.Application]::DoEvents()
-            Start-Sleep -Milliseconds 50
-        }
+        $script:Scale = Get-UiScale
+        $sampleSource = 'The quick brown fox jumps over the lazy dog. This sentence is deliberately long so the source block has to clamp to two lines and ellipsize instead of pushing the translation out of the card.'
+        $sampleBody = "快速的棕色狐狸跳过了懒狗。这句话故意写得很长，用来检查译文区域在达到最大高度之前能不能正常换行、不被裁切，也不会把底栏顶出卡片之外。`r`n`r`n换行也要正常：第二段应该完整显示。"
+        $script:LastSource = $sampleSource
+        Show-Overlay '→ 简体中文' $sampleSource $sampleBody '860 ms · zh-Hans' 240 220
+        $deadline = [Environment]::TickCount + 800
+        while ([Environment]::TickCount -lt $deadline) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }
+        $form = $script:Overlay
+        $form.Refresh()
+        [System.Windows.Forms.Application]::DoEvents()
+        $bounds = $form.Bounds
+        $bmp = New-Object System.Drawing.Bitmap([int]$bounds.Width, [int]$bounds.Height)
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+        $bmp.Save($ShotPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        $g.Dispose(); $bmp.Dispose()
+        $result.shot = $ShotPath
+        $result.size = ('{0}x{1}' -f $form.Width, $form.Height)
+        $result.ok = $true
         Hide-Overlay
         if ($script:Overlay -and -not $script:Overlay.IsDisposed) { $script:Overlay.Dispose() }
-        $ok = $true
     } catch {
-        $err = $_.Exception.Message
+        $result.error = $_.Exception.Message
     }
-    @{ ok = $ok; error = $err } | ConvertTo-Json
-    if ($ok) { exit 0 } else { exit 1 }
+    $result | ConvertTo-Json
+    if ($result.ok) { exit 0 } else { exit 1 }
 }
 
 # ───────────────────────────── 探针：光标处能不能取到选区 ─────────────────────────────
 
 if ($Probe) {
     $hwnd = [DTWin32]::GetForegroundWindow()
-    $pos = [DTWin32+POINT]::new()
-    [void][DTWin32]::GetCursorPos([ref]$pos)
+    $pos = Get-Point
     $uiaText = ''
     try {
         $found = Get-SelectionViaUia (New-Object System.Windows.Point($pos.X, $pos.Y))
@@ -519,13 +868,13 @@ if ($Probe) {
         try { $clipText = Get-SelectionViaClipboard $hwnd } catch { }
     }
     $result = [ordered]@{
-        ok         = $true
-        foreground = (Get-WindowTitle $hwnd)
+        ok          = $true
+        foreground  = (Get-WindowTitle $hwnd)
         windowClass = (Get-WindowClass $hwnd)
-        process    = (Get-ProcessNameOfWindow $hwnd)
-        uia        = $uiaText
-        clipboard  = $clipText
-        source     = $(if ($uiaText) { 'uia' } elseif ($clipText) { 'clipboard' } else { 'none' })
+        process     = (Get-ProcessNameOfWindow $hwnd)
+        uia         = $uiaText
+        clipboard   = $clipText
+        source      = $(if ($uiaText) { 'uia' } elseif ($clipText) { 'clipboard' } else { 'none' })
     }
     $result | ConvertTo-Json -Depth 3
     exit 0
@@ -564,14 +913,12 @@ if ($SelfTest) {
 
 # ───────────────────────────── 单实例 + 主循环 ─────────────────────────────
 
-# 单实例：会话内互斥体（Local\ 不需要 SeCreateGlobalPrivilege）；建不出来就用 PID 文件兜底
 $mutexName = "Local\dsh-translate-capture"
 $pidFile = Join-Path $env:TEMP 'dsh-translate-capture.pid'
 $mutex = $null
 $ownedPidFile = $false
 try {
     $mutex = New-Object System.Threading.Mutex($false, $mutexName)
-    # 重启时新进程可能比旧进程先起来：留 3 秒等旧实例退场，别把自己也退掉
     if (-not $mutex.WaitOne(3000)) {
         Write-Log 'another instance holds the mutex; exiting'
         exit 0
@@ -597,19 +944,18 @@ if (-not $mutex) {
     } catch { }
 }
 
-Write-Log ("start version=" + $script:ScriptVersion + " port=" + $Port + " target=" + $Target + " parent=" + $ParentPid)
+$script:Scale = Get-UiScale
+Write-Log ("start version=" + $script:ScriptVersion + " port=" + $Port + " target=" + $Target + " scale=" + $script:Scale + " parent=" + $ParentPid)
 
 $parentCheckedAt = [Environment]::TickCount
-$lastLoop = [Environment]::TickCount
 
 try {
     while ($true) {
         Complete-Translate
 
-        # 父进程看门狗（DSH 退出/重启时不留幽灵进程）
         if ($ParentPid -gt 0) {
             $now = [Environment]::TickCount
-            if ($now - $parentCheckedAt -gt 3000) {
+            if (($now - $parentCheckedAt) -gt 3000) {
                 $parentCheckedAt = $now
                 if (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) {
                     Write-Log 'parent process gone; exiting'
@@ -618,9 +964,7 @@ try {
             }
         }
 
-        # 鼠标手势
-        $pos = [DTWin32+POINT]::new()
-        [void][DTWin32]::GetCursorPos([ref]$pos)
+        $pos = Get-Point
         $down = (([DTWin32]::GetAsyncKeyState(0x01) -band 0x8000) -ne 0)
         $now = [Environment]::TickCount
 
@@ -640,7 +984,7 @@ try {
                 $ddx = $pos.X - $script:LastClickPoint.X
                 $ddy = $pos.Y - $script:LastClickPoint.Y
                 $dist = [Math]::Sqrt($ddx * $ddx + $ddy * $ddy)
-                $isDouble = (($now - $script:LastClickAt) -lt 450) -and ($dist -lt 8)
+                $isDouble = ((($now - $script:LastClickAt) -lt 450) -and ($dist -lt 8))
             }
             if ($moved -ge 5 -or $isDouble) {
                 try { Invoke-Gesture $pos $script:DownPoint } catch { Write-Log ('gesture failed: ' + $_.Exception.Message) }
@@ -650,7 +994,6 @@ try {
         }
         $script:LeftDown = $down
 
-        # 浮窗自动收起（20s）
         if ($script:Overlay -and -not $script:Overlay.IsDisposed -and $script:Overlay.Visible -and -not $script:Task) {
             if ($script:HiddenAt -eq 0) { $script:HiddenAt = $now }
             elseif (($now - $script:HiddenAt) -gt 20000) { Hide-Overlay }

@@ -27,6 +27,15 @@
   ↓ 光标旁原生置顶浮窗：译文 / 复制 / 关闭（Esc、点外、20s 自动收起）
 ```
 
+- **视觉跟页面内浮层一致**：原生窗口是自绘卡片——400 DIP 宽、12px 圆角、跟随 DSH 主题 token
+  （卡片底色 / 边框 / 主次文字 / 字体都从页面 `getComputedStyle` 里取，亮暗主题自动跟），
+  结构也一样：标题栏（→ 目标语言 + ✕）/ 原文（灰、两行、虚线）/ 译文（13px，超高可滚轮）/
+  底栏（耗时 + 重译 + 复制）。高度按实际换行测量，不再有裁切或半截字。
+
+  | 暗色 | 亮色 |
+  | --- | --- |
+  | ![暗色浮窗](docs/overlay-dark.png) | ![亮色浮窗](docs/overlay-light.png) |
+
 - **不需要热键**：划译总开关 + 「外部（任意应用）」都开（默认都是开）就生效。
 - **不重复弹窗**：伴生进程认出 DSH 桌面端窗口（进程 `DeepSeek Harness`）就跳过——那个窗口
   交给页面内浮层；`设置 → DSH 页面内也显示浮层`（默认开）控制页面内浮层本身。
@@ -49,8 +58,8 @@ powershell.exe -NoProfile -STA -ExecutionPolicy Bypass   -File helper/dsh-transl
 #    输出 uia / clipboard 两条路各自读到了什么、这次会走哪条
 powershell.exe -NoProfile -STA -ExecutionPolicy Bypass   -File helper/dsh-translate-capture.ps1 -Port 61213 -Probe
 
-# 3) 浮窗冒烟：屏幕右下角闪一个 2.5 秒的小窗（验证原生置顶窗口能画出来）
-powershell.exe -NoProfile -STA -ExecutionPolicy Bypass   -File helper/dsh-translate-capture.ps1 -TestOverlay
+# 3) 浮窗冒烟：画一帧并截图（验证原生置顶窗口的排版/配色；-ThemePath 可指定主题文件）
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass   -File helper/dsh-translate-capture.ps1 -TestOverlay -ShotPath C:\Temp\overlay.png
 
 # 4) 日志（每次手势、取词来源、启动/退出都会写）
 type %TEMP%\dsh-translate-capture.log
