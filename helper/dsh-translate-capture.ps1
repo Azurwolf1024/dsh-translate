@@ -26,6 +26,7 @@ param(
     [string]$LogPath = "$env:TEMP\dsh-translate-capture.log",
     [string]$ThemePath = '',
     [string]$ShotPath = "$env:TEMP\dsh-translate-overlay.png",
+    [string]$TestAnchor = '',
     [switch]$SelfTest,
     [switch]$Probe,
     [switch]$TestOverlay,
@@ -33,7 +34,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '1.2.1'
+$script:ScriptVersion = '1.2.2'
 $script:ThemePath = $ThemePath
 
 # ───────────────────────────── 日志 ─────────────────────────────
@@ -128,6 +129,7 @@ $script:BodyMaxScroll = 0
 $script:BodyLineHeight = 16
 $script:ScrollOffset = 0
 $script:LastSource = ''
+$script:Anchor = $null
 $script:TitleText = ''
 $script:SourceText = ''
 $script:MetaText = ''
@@ -455,7 +457,9 @@ function Get-SelectionViaClipboard([IntPtr]$hwnd) {
         }
     }
 
-    if ($text -and $beforeText -and $text -eq $beforeText) { $text = '' }
+    # 只有在「剪贴板根本没被写过」时才算失败；序号变了就说明应用真的复制了，
+    # 哪怕内容和上一次一样（重复选同一段）也是有效结果。
+    if (-not $text -and $beforeText) { $text = '' }
     if ($text -and $saved) {
         try { [System.Windows.Forms.Clipboard]::SetDataObject($saved, $true) } catch { }
     }
@@ -730,11 +734,20 @@ function Show-Overlay([string]$title, [string]$source, [string]$body, [string]$m
     $script:ScrollOffset = 0
     Update-OverlayLayout $source $body
 
-    $screen = [System.Windows.Forms.Screen]::FromPoint((New-Object System.Drawing.Point($x, $y)))
+    $anchor = $script:Anchor
+    $anchorX = if ($anchor) { [int]$anchor.left } else { $x }
+    $anchorTop = if ($anchor) { [int]$anchor.top } else { $y }
+    $anchorBottom = if ($anchor) { [int]$anchor.bottom } else { $y }
+    $screen = [System.Windows.Forms.Screen]::FromPoint((New-Object System.Drawing.Point($anchorX, $anchorBottom)))
     $wa = $screen.WorkingArea
-    $left = [Math]::Min([Math]::Max($wa.Left + 10, $x + 14), ($wa.Right - $form.Width - 10))
-    $top = $y + 20
-    if (($top + $form.Height) -gt ($wa.Bottom - 10)) { $top = $y - $form.Height - 14 }
+    $left = [Math]::Min([Math]::Max($wa.Left + 10, $anchorX), ($wa.Right - $form.Width - 10))
+    $gap = [int](8 * $script:Scale)
+    $top = $anchorBottom + $gap
+    if (($top + $form.Height) -gt ($wa.Bottom - 10)) {
+        # 下方放不下 → 翻到选区上方
+        $flipped = $anchorTop - $form.Height - $gap
+        $top = if ($flipped -ge ($wa.Top + 10)) { $flipped } else { [Math]::Max($wa.Top + 10, $wa.Bottom - 10 - $form.Height) }
+    }
     if ($top -lt ($wa.Top + 10)) { $top = $wa.Top + 10 }
     $form.Location = New-Object System.Drawing.Point([int]$left, [int]$top)
     if (-not $form.Visible) { $form.Show() }
@@ -813,6 +826,26 @@ function Complete-Translate() {
 
 # ───────────────────────────── 手势 → 取词 → 翻译 ─────────────────────────────
 
+function Set-AnchorFromRects([DTWin32+POINT]$point, $rects) {
+    $left = [double]$point.X
+    $top = [double]$point.Y
+    $right = [double]$point.X
+    $bottom = [double]$point.Y
+    if ($rects -and $rects.Count -gt 0) {
+        $left = $rects[0].left
+        $top = $rects[0].top
+        $right = $rects[0].right
+        $bottom = $rects[0].bottom
+        foreach ($r in $rects) {
+            if ($r.left -lt $left) { $left = $r.left }
+            if ($r.top -lt $top) { $top = $r.top }
+            if ($r.right -gt $right) { $right = $r.right }
+            if ($r.bottom -gt $bottom) { $bottom = $r.bottom }
+        }
+    }
+    $script:Anchor = @{ left = $left; top = $top; right = $right; bottom = $bottom }
+}
+
 function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
     $hwnd = [DTWin32]::GetForegroundWindow()
     if ($hwnd -eq [IntPtr]::Zero) { return }
@@ -832,13 +865,18 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
             if ($found -and $found.text -and $found.text.Trim().Length -gt 0) {
                 $near = (Test-PointNearRects $point.X $point.Y $found.rects)
                 if (-not $near -and $pressPoint) { $near = (Test-PointNearRects $pressPoint.X $pressPoint.Y $found.rects) }
-                if ($near) { $text = $found.text; break }
+                if ($near) {
+                    $text = $found.text
+                    Set-AnchorFromRects $point $found.rects
+                    break
+                }
                 Write-Log ("stale selection ignored chars=" + $found.text.Length)
                 return
             }
             Start-Sleep -Milliseconds 160
         }
     }
+    if (-not $script:Anchor) { Set-AnchorFromRects $point $null }
     if (-not $text -or $text.Trim().Length -eq 0) {
         $source = 'clipboard'
         try { $text = Get-SelectionViaClipboard ($hwnd) } catch { $text = '' }
@@ -864,7 +902,8 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
     $script:LastText = $text
     $script:LastTextAt = $now
 
-    Write-Log ("gesture source=$source chars=" + $text.Length)
+    $appLabel = (Get-ProcessNameOfWindow $hwnd)
+    Write-Log ("gesture app=$appLabel source=$source chars=" + $text.Length)
     Start-Translate $text $point.X $point.Y
 }
 
@@ -877,6 +916,12 @@ if ($TestOverlay) {
         $sampleSource = 'The quick brown fox jumps over the lazy dog. This sentence is deliberately long so the source block has to clamp to two lines and ellipsize instead of pushing the translation out of the card.'
         $sampleBody = "快速的棕色狐狸跳过了懒狗。这句话故意写得很长，用来检查译文区域在达到最大高度之前能不能正常换行、不被裁切，也不会把底栏顶出卡片之外。`r`n`r`n换行也要正常：第二段应该完整显示。"
         $script:LastSource = $sampleSource
+        if ($TestAnchor) {
+            $parts0 = $TestAnchor.Split(',')
+            if ($parts0.Count -eq 4) {
+                $script:Anchor = @{ left = [double]$parts0[0]; top = [double]$parts0[1]; right = [double]$parts0[2]; bottom = [double]$parts0[3] }
+            }
+        }
         Show-Overlay '→ 简体中文' $sampleSource $sampleBody '860 ms · zh-Hans' 240 220
         $deadline = [Environment]::TickCount + 800
         while ([Environment]::TickCount -lt $deadline) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }
@@ -884,12 +929,40 @@ if ($TestOverlay) {
         $form.Refresh()
         [System.Windows.Forms.Application]::DoEvents()
         $bounds = $form.Bounds
-        $bmp = New-Object System.Drawing.Bitmap([int]$bounds.Width, [int]$bounds.Height)
-        $g = [System.Drawing.Graphics]::FromImage($bmp)
-        $g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-        $bmp.Save($ShotPath, [System.Drawing.Imaging.ImageFormat]::Png)
-        $g.Dispose(); $bmp.Dispose()
+        $capture = {
+            param($path)
+            $bmp = New-Object System.Drawing.Bitmap([int]$bounds.Width, [int]$bounds.Height)
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+            $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+        }
+        & $capture $ShotPath
         $result.shot = $ShotPath
+        $result.placed = ('left=' + $form.Left + ' top=' + $form.Top + ' size=' + $form.Width + 'x' + $form.Height + ' anchorBottom=' + $script:Anchor.bottom)
+        if ($TestAnchor) {
+            $parts = $TestAnchor.Split(',')
+            if ($parts.Count -eq 4) {
+                $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+                $script:Anchor = @{
+                    left   = [double]($wa.Left + 200)
+                    top    = [double]($wa.Bottom - 60)
+                    right  = [double]($wa.Left + 700)
+                    bottom = [double]($wa.Bottom - 40)
+                }
+                Show-Overlay '→ 简体中文（翻到上方）' $sampleSource $sampleBody '860 · zh-Hans' 240 220
+                [System.Windows.Forms.Application]::DoEvents()
+                $flipShot = [System.IO.Path]::ChangeExtension($ShotPath, $null) + 'flip.png'
+                $bounds2 = $script:Overlay.Bounds
+                $bmp2 = New-Object System.Drawing.Bitmap([int]$bounds2.Width, [int]$bounds2.Height)
+                $g2 = [System.Drawing.Graphics]::FromImage($bmp2)
+                $g2.CopyFromScreen($bounds2.Location, [System.Drawing.Point]::Empty, $bounds2.Size)
+                $bmp2.Save($flipShot, [System.Drawing.Imaging.ImageFormat]::Png)
+                $g2.Dispose(); $bmp2.Dispose()
+                $result.flipShot = $flipShot
+                $result.flipPlaced = ('left=' + $script:Overlay.Left + ' top=' + $script:Overlay.Top + ' anchorTop=' + $script:Anchor.top)
+            }
+        }
         $result.size = ('{0}x{1}' -f $form.Width, $form.Height)
         # 命中测试回归：这两个表达式之前用 Point 传 RectangleF 会抛异常（点重译就弹 .NET 错误框）
         $layout = $script:Layout
