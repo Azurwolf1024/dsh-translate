@@ -133,6 +133,7 @@ $script:SourceText = ''
 $script:MetaText = ''
 $script:Theme = $null
 $script:ThemeAt = [DateTime]::MinValue
+$script:FontScale = 0
 $script:Scale = 1.0
 $script:HiddenAt = 0
 $script:TerminalClasses = @('ConsoleWindowClass', 'CASCADIA_HOSTING_WINDOW_CLASS', 'mintty', 'PseudoConsoleWindow', 'PuTTY')
@@ -306,14 +307,25 @@ function Get-Theme() {
     return $base
 }
 
+function Update-Fonts() {
+    $scale = if ($script:Scale -gt 0) { $script:Scale } else { 1.0 }
+    if ($script:FontScale -eq $scale -and $script:FontBody) { return }
+    $script:FontScale = $scale
+    # 内页浮层是 CSS px：12/13/11 CSS px 在 DPI 缩放下要乘缩放系数，否则 200% 屏上只有一半大
+    $script:FontTitle = New-Object System.Drawing.Font($script:Theme.fontFamily, [single](12 * $scale), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+    $script:FontBody = New-Object System.Drawing.Font($script:Theme.fontFamily, [single](13 * $scale), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+    $script:FontSmall = New-Object System.Drawing.Font($script:Theme.fontFamily, [single](11 * $scale), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+}
+
 function Update-Theme {
     $now = Get-Date
-    if ($script:Theme -and ($now - $script:ThemeAt).TotalSeconds -lt 1) { return }
+    if ($script:Theme -and ($now - $script:ThemeAt).TotalSeconds -lt 1) {
+        Update-Fonts
+        return
+    }
     $script:Theme = Get-Theme
     $script:ThemeAt = $now
-    $script:FontTitle = New-Object System.Drawing.Font($script:Theme.fontFamily, [single]12, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
-    $script:FontBody = New-Object System.Drawing.Font($script:Theme.fontFamily, [single]13, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
-    $script:FontSmall = New-Object System.Drawing.Font($script:Theme.fontFamily, [single]11, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+    Update-Fonts
 }
 
 function Get-UiScale() {
@@ -344,6 +356,18 @@ function Test-PointNearRects([int]$x, [int]$y, $rects) {
             $y -ge ($r.top - $margin) -and $y -le ($r.bottom + $margin)) { return $true }
     }
     return $false
+}
+
+# PDF/WebView 的文本层经常把词间空格吞掉（"TheInnerProduct"），逐字给模型只会原样吐回。
+# 先试一次剪贴板取词（有空白就优先用它），再退化成按大小写边界补空格。
+function Restore-WordSpacing([string]$text) {
+    if (-not $text) { return $text }
+    if ($text -match '\s') { return $text }
+    if ($text.Length -lt 8) { return $text }
+    $spaced = [regex]::Replace($text, '(?<=[a-z])(?=[A-Z])', ' ')
+    $spaced = [regex]::Replace($spaced, '(?<=[A-Za-z])(?=[0-9])', ' ')
+    $spaced = [regex]::Replace($spaced, '(?<=[0-9])(?=[A-Za-z])', ' ')
+    return $spaced
 }
 
 function Get-SelectionViaUia([System.Windows.Point]$point) {
@@ -465,6 +489,7 @@ function Get-LineHeight([System.Drawing.Graphics]$graphics, [System.Drawing.Font
 
 function Ensure-Overlay() {
     if ($script:Overlay -and -not $script:Overlay.IsDisposed) { return $script:Overlay }
+    if (-not $script:Scale) { $script:Scale = Get-UiScale }
     Update-Theme
 
     $form = New-Object DtCard
@@ -570,32 +595,44 @@ function Ensure-Overlay() {
 
     $form.Add_MouseDown({
         param($sender, $event)
-        if ($event.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
-        $layout = $script:Layout
-        if (-not $layout) { return }
-        if ($layout.closeRect.Contains($event.Location)) { Hide-Overlay; return }
-        if ($layout.copyRect.Contains($event.Location)) {
-            try { [System.Windows.Forms.Clipboard]::SetText($script:TextBody) } catch { }
-            return
+        try {
+            if ($event.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+            $layout = $script:Layout
+            if (-not $layout) { return }
+            # RectangleF.Contains 只认 PointF/单精度；Event.Location 是整型 Point，直接传会抛
+            $point = New-Object System.Drawing.PointF([single]$event.X, [single]$event.Y)
+            if ($layout.closeRect.Contains($point)) { Hide-Overlay; return }
+            if ($layout.copyRect.Contains($point)) {
+                try { [System.Windows.Forms.Clipboard]::SetText($script:TextBody) } catch { }
+                return
+            }
+            if ($layout.retryRect.Contains($point)) { Retry-Translate; return }
+            $script:DragStart = $event.Location
+            $script:DragOrigin = $sender.Location
+        } catch {
+            Write-Log ('overlay click failed: ' + $_.Exception.Message)
         }
-        if ($layout.retryRect.Contains($event.Location)) { Retry-Translate; return }
-        $script:DragStart = $event.Location
-        $script:DragOrigin = $sender.Location
     })
     $form.Add_MouseMove({
         param($sender, $event)
-        if ($event.Button -eq [System.Windows.Forms.MouseButtons]::Left -and $script:DragStart) {
-            $sender.Location = New-Object System.Drawing.Point(
-                ($script:DragOrigin.X + $event.X - $script:DragStart.X),
-                ($script:DragOrigin.Y + $event.Y - $script:DragStart.Y))
-        }
+        try {
+            if ($event.Button -eq [System.Windows.Forms.MouseButtons]::Left -and $script:DragStart) {
+                $sender.Location = New-Object System.Drawing.Point(
+                    ($script:DragOrigin.X + $event.X - $script:DragStart.X),
+                    ($script:DragOrigin.Y + $event.Y - $script:DragStart.Y))
+            }
+        } catch { }
     })
     $form.Add_MouseUp({ $script:DragStart = $null })
     $form.Add_KeyDown({
         param($sender, $event)
-        if ($event.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { Hide-Overlay; $event.Handled = $true }
+        try {
+            if ($event.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { Hide-Overlay; $event.Handled = $true }
+        } catch { }
     })
-    $form.Add_Deactivate({ Hide-Overlay })
+    $form.Add_Deactivate({
+        try { Hide-Overlay } catch { }
+    })
 
     $script:Overlay = $form
     $script:BodyBox = $body
@@ -805,6 +842,17 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
     if (-not $text -or $text.Trim().Length -eq 0) {
         $source = 'clipboard'
         try { $text = Get-SelectionViaClipboard ($hwnd) } catch { $text = '' }
+    } elseif ($text -notmatch '\s' -and $text.Length -ge 8) {
+        # UIA 读到了但完全没有空白：多半是 PDF 文本层，剪贴板通常更准
+        $rescued = ''
+        try { $rescued = Get-SelectionViaClipboard ($hwnd) } catch { $rescued = '' }
+        if ($rescued -and $rescued -match '\s') {
+            $text = $rescued
+            $source = 'clipboard-rescue'
+        } else {
+            $text = Restore-WordSpacing $text
+            $source = 'uia-respaced'
+        }
     }
     if (-not $text) { return }
     $text = $text.Trim()
@@ -843,6 +891,11 @@ if ($TestOverlay) {
         $g.Dispose(); $bmp.Dispose()
         $result.shot = $ShotPath
         $result.size = ('{0}x{1}' -f $form.Width, $form.Height)
+        # 命中测试回归：这两个表达式之前用 Point 传 RectangleF 会抛异常（点重译就弹 .NET 错误框）
+        $layout = $script:Layout
+        $copyPoint = New-Object System.Drawing.PointF([single]($layout.copyRect.X + 2), [single]($layout.copyRect.Y + 2))
+        $retryPoint = New-Object System.Drawing.PointF([single]($layout.retryRect.X + 2), [single]($layout.retryRect.Y + 2))
+        $result.hitTest = ('copy=' + $layout.copyRect.Contains($copyPoint) + ' retry=' + $layout.retryRect.Contains($retryPoint))
         $result.ok = $true
         Hide-Overlay
         if ($script:Overlay -and -not $script:Overlay.IsDisposed) { $script:Overlay.Dispose() }
