@@ -42,6 +42,11 @@
 - **不重复弹窗**：伴生进程认出 DSH 桌面端窗口（进程 `DeepSeek Harness`）就跳过——那个窗口
   交给页面内浮层；`设置 → DSH 页面内也显示浮层`（默认开）控制页面内浮层本身。
   如果你在普通浏览器里开 DSH 网页，系统侧无法区分标签页，两者会同时出现，关掉页面内浮层即可。
+- **OCR 兜底（Windows 自带，无需安装）**：UIA 和剪贴板都拿不到像样文字时，截取选区那块屏幕，
+  用系统自带的 `Windows.Media.Ocr` 识别。触发条件是：取不到任何文字（图片型 PDF / 扫描件），
+  或取到的文字没有词间空格（`TheInnerProduct`）。英文走 en-US 引擎、中文走系统语言引擎，
+  两边都跑再挑更靠谱的结果；中文 OCR 会把每个汉字用空格隔开，这里会先收拢再交给模型。
+  实测带选中高亮（浅蓝底黑字）也能认。想关掉：伴生进程加 `-NoOcr`。
 - **PDF 文本层丢空格**：不少 PDF 阅读器的 UIA 选区是 `TheInnerProduct` 这种（连末尾换行一起给），
   直接喂模型只会原样吐回。现在先 Trim，若仍无词间空白就先走一次剪贴板取词（有空格优先用），
   再退化成按大小写边界补空格（`TheInnerProduct → The Inner Product`）。
@@ -66,7 +71,10 @@ powershell.exe -NoProfile -STA -ExecutionPolicy Bypass   -File helper/dsh-transl
 # 3) 浮窗冒烟：画一帧并截图（验证原生置顶窗口的排版/配色；-ThemePath 可指定主题文件）
 powershell.exe -NoProfile -STA -ExecutionPolicy Bypass   -File helper/dsh-translate-capture.ps1 -TestOverlay -ShotPath C:\Temp\overlay.png
 
-# 4) 日志（每次手势、取词来源、启动/退出都会写）
+# 4) OCR 自检：画三张位图（英文 / 中文 / 选中高亮）走一遍识别，不碰屏幕
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass   -File helper/dsh-translate-capture.ps1 -TestOcr
+
+# 5) 日志（每次手势、取词来源、启动/退出都会写）
 type %TEMP%\dsh-translate-capture.log
 ```
 
@@ -149,6 +157,7 @@ node tests/client_selftest.mjs
 
 - 一次只翻一段（串行），保证小模型显存与延迟稳定；取消会立刻停止后续段。
 - `繁體中文` 用中文语言名 + 中文提示驱动（1.8B 模型对英文语言名会输出简体），实测短句/段落/简→繁都稳定。
+- OCR 有识别噪声（`Inner` 偶尔认成 `lnner`、`If` 认成 `阡`），但整段语义足够模型翻译；
 - 页内划译只作用于页面内可选中的文本；输入框/可编辑区域/DOM 之外的选区会被忽略（外部划译另外处理）。
 - 路由只在回环地址上服务，没有额外的令牌鉴权（与宿主自身「只绑回环」的部署假设一致）；
   请求侧校验 `Origin` / `Sec-Fetch-Site`，跨站请求一律 403。

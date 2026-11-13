@@ -30,11 +30,13 @@ param(
     [switch]$SelfTest,
     [switch]$Probe,
     [switch]$TestOverlay,
-    [switch]$NoUi
+    [switch]$NoUi,
+    [switch]$NoOcr,
+    [switch]$TestOcr
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '1.2.6'
+$script:ScriptVersion = '1.3.0'
 $script:ThemePath = $ThemePath
 
 # ───────────────────────────── 日志 ─────────────────────────────
@@ -50,6 +52,7 @@ function Write-Log([string]$message) {
 # ───────────────────────────── 原生互操作 ─────────────────────────────
 
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase, System.Windows.Forms, System.Drawing, System.Net.Http
+try { Add-Type -AssemblyName System.Runtime.WindowsRuntime } catch { }
 
 $uiRefs = @([System.Windows.Forms.Form].Assembly.Location, [System.Drawing.Color].Assembly.Location)
 Add-Type -TypeDefinition @'
@@ -129,6 +132,8 @@ $script:BodyMaxScroll = 0
 $script:BodyLineHeight = 16
 $script:ScrollOffset = 0
 $script:LastSource = ''
+$script:OcrEngine = $null
+$script:OcrReady = 0
 $script:Anchor = $null
 $script:TitleText = ''
 $script:SourceText = ''
@@ -464,6 +469,151 @@ function Get-SelectionViaClipboard([IntPtr]$hwnd) {
         try { [System.Windows.Forms.Clipboard]::SetDataObject($saved, $true) } catch { }
     }
     return $text
+}
+
+# ───────────────────────────── 取词：OCR 兜底（Windows 自带 WinRT OCR） ─────────────────────────────
+# 适用：图片型 PDF、扫描件、文本层坏了/没空格的场景——截取选区那块屏幕再去识别。
+
+function Await-WinRt($operation, $resultType) {
+    $methods = [System.WindowsRuntimeSystemExtensions].GetMethods()
+    $generic = $methods | Where-Object {
+        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+        $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+    } | Select-Object -First 1
+    if (-not $generic) { throw 'AsTask(IAsyncOperation<T>) not found' }
+    $asTask = $generic.MakeGenericMethod($resultType)
+    $netTask = $asTask.Invoke($null, @($operation))
+    $netTask.Wait(-1) | Out-Null
+    return $netTask.Result
+}
+
+function Initialize-Ocr() {
+    if ($script:OcrReady -eq 1) { return $script:OcrEngines }
+    if ($script:OcrReady -eq -1) { return $null }
+    $script:OcrReady = -1
+    $engines = @()
+    try {
+        [void][Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType=WindowsRuntime]
+        [void][Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType=WindowsRuntime]
+        [void][Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Foundation, ContentType=WindowsRuntime]
+        [void][Windows.Globalization.Language, Windows.Foundation, ContentType=WindowsRuntime]
+        try {
+            $english = New-Object Windows.Globalization.Language 'en-US'
+            $candidate = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($english)
+            if ($candidate) { $engines += $candidate }
+        } catch { }
+        try {
+            $candidate = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+            if ($candidate) {
+                # 和 en-US 相同时不要重复
+                $duplicate = $false
+                foreach ($existing in $engines) {
+                    if ($existing.RecognizerLanguage.LanguageTag -eq $candidate.RecognizerLanguage.LanguageTag) { $duplicate = $true }
+                }
+                if (-not $duplicate) { $engines += $candidate }
+            }
+        } catch { }
+        if ($engines.Count -gt 0) {
+            $script:OcrEngines = $engines
+            $script:OcrReady = 1
+            Write-Log ('ocr engines: ' + (($engines | ForEach-Object { $_.RecognizerLanguage.LanguageTag }) -join ','))
+            return $engines
+        }
+        Write-Log 'ocr engine unavailable (no language pack)'
+        return $null
+    } catch {
+        Write-Log ('ocr init failed: ' + $_.Exception.Message)
+        return $null
+    }
+}
+
+function Invoke-OcrWithEngine([System.Drawing.Bitmap]$bitmap, $engine) {
+    if (-not $engine -or -not $bitmap) { return '' }
+    $stream = $null
+    try {
+        $stream = New-Object System.IO.MemoryStream
+        $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+        $stream.Position = 0
+        $ras = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($stream)
+        $decoder = Await-WinRt ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($ras)) ([Windows.Graphics.Imaging.BitmapDecoder])
+        $software = Await-WinRt ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+        $result = Await-WinRt ($engine.RecognizeAsync($software)) ([Windows.Media.Ocr.OcrResult])
+        $lines = @()
+        foreach ($line in $result.Lines) {
+            $value = $line.Text
+            if ($value) { $lines += $value.Trim() }
+        }
+        $text = ($lines -join "`n")
+        # Windows 的中文 OCR 会把每个汉字当独立词、用空格隔开（"内 积 是 …"）：
+        # 把汉字之间的空格收掉，否则喂给翻译模型也是碎的。
+        $text = [regex]::Replace($text, '(?<=[一-鿿])\s+(?=[一-鿿])', '')
+        $text = [regex]::Replace($text, '(?<=[一-鿿])\s+(?=[，。；：！？、（）【】])', '')
+        return $text
+    } catch {
+        Write-Log ('ocr recognize failed (' + $engine.RecognizerLanguage.LanguageTag + '): ' + $_.Exception.Message)
+        return ''
+    } finally {
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
+function Invoke-OcrBitmap([System.Drawing.Bitmap]$bitmap) {
+    $engines = Initialize-Ocr
+    if (-not $engines -or -not $bitmap) { return '' }
+    $source = $bitmap
+    $scaled = $null
+    try {
+        # 小字放大 2 倍再识别（200% 缩放下一般够大，小选区/小字时有用）
+        if ($bitmap.Height -lt [int](40 * $script:Scale)) {
+            $scaled = New-Object System.Drawing.Bitmap -ArgumentList ($bitmap.Width * 2), ($bitmap.Height * 2)
+            $g = [System.Drawing.Graphics]::FromImage($scaled)
+            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g.DrawImage($bitmap, 0, 0, $scaled.Width, $scaled.Height)
+            $g.Dispose()
+            $source = $scaled
+        }
+        $best = ''
+        foreach ($engine in $engines) {
+            $text = Invoke-OcrWithEngine $source $engine
+            if (-not $text) { continue }
+            if (-not $best) { $best = $text; continue }
+            # 中文只有中文引擎认得出：谁认出 CJK 就用谁
+            if ($text -match '[\u4e00-\u9fff]' -and $best -notmatch '[\u4e00-\u9fff]') { $best = $text; continue }
+            if ($best -match '[\u4e00-\u9fff]') { continue }
+            if ($text.Length -gt $best.Length) { $best = $text }
+        }
+        return $best
+    } finally {
+        if ($scaled) { $scaled.Dispose() }
+    }
+}
+
+# 截取屏幕上一块矩形去 OCR（矩形是物理像素，和 UIA 的坐标系一致）
+function Get-TextViaOcr([double]$left, [double]$top, [double]$right, [double]$bottom) {
+    if ($NoOcr) { return '' }
+    if (-not (Initialize-Ocr)) { return '' }
+    $virtual = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $pad = [int](6 * $script:Scale)
+    $x = [Math]::Max($virtual.Left, [int]$left - $pad)
+    $y = [Math]::Max($virtual.Top, [int]$top - $pad)
+    $x2 = [Math]::Min($virtual.Right, [int]$right + $pad)
+    $y2 = [Math]::Min($virtual.Bottom, [int]$bottom + $pad)
+    $width = [int]($x2 - $x)
+    $height = [int]($y2 - $y)
+    if ($width -lt 8 -or $height -lt 8 -or $width -gt 5000 -or $height -gt 4000) { return '' }
+    $bitmap = $null
+    try {
+        $bitmap = New-Object System.Drawing.Bitmap -ArgumentList $width, $height
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        $graphics.CopyFromScreen($x, $y, 0, 0, (New-Object System.Drawing.Size($width, $height)))
+        $graphics.Dispose()
+        return Invoke-OcrBitmap $bitmap
+    } catch {
+        Write-Log ('ocr capture failed: ' + $_.Exception.Message)
+        return ''
+    } finally {
+        if ($bitmap) { $bitmap.Dispose() }
+    }
 }
 
 # ───────────────────────────── 浮窗 ─────────────────────────────
@@ -889,8 +1039,8 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
             $text = Restore-WordSpacing $text
             $source = 'clipboard-respaced'
         }
-    } elseif ($text -notmatch '\s' -and $text.Length -ge 8) {
-        # 完全没有词间空白：多半是 PDF 文本层，剪贴板通常更准
+    } elseif ($text -match '[A-Za-z]' -and $text -notmatch '[一-鿿]' -and $text -notmatch '\s' -and $text.Length -ge 8) {
+        # 纯拉丁文本却完全没有词间空白：多半是 PDF 文本层，剪贴板通常更准
         $rescued = ''
         try { $rescued = Get-SelectionViaClipboard ($hwnd) } catch { $rescued = '' }
         if ($rescued) { $rescued = $rescued.Trim() }
@@ -900,6 +1050,35 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
         } else {
             $text = Restore-WordSpacing $text
             $source = 'uia-respaced'
+        }
+    }
+    # 到这里 UIA 和剪贴板都没拿到像样的文字（或拿到的没有词间空格）：用 OCR 兜底。
+    # 区域优先用 UIA 给的选区矩形，其次用这次拖选/双击的起止点。
+    $ocrBox = $null
+    if ($script:Anchor) {
+        $ocrBox = $script:Anchor
+    } elseif ($pressPoint) {
+        $ocrBox = @{
+            left   = [Math]::Min($pressPoint.X, $point.X)
+            top    = [Math]::Min($pressPoint.Y, $point.Y)
+            right  = [Math]::Max($pressPoint.X, $point.X)
+            bottom = [Math]::Max($pressPoint.Y, $point.Y)
+        }
+    }
+    $looksLikeBrokenLatin = ($text -match '[A-Za-z]' -and $text -notmatch '[一-鿿]' -and $text -notmatch '\s' -and $text.Length -ge 8)
+    if (-not $text -or $looksLikeBrokenLatin) {
+        if ($ocrBox) {
+            $ocrText = ''
+            try { $ocrText = Get-TextViaOcr $ocrBox.left $ocrBox.top $ocrBox.right $ocrBox.bottom } catch { $ocrText = '' }
+            if ($ocrText) {
+                $ocrText = $ocrText.Trim()
+                # OCR 比现有文本更像话（有词间空格，或原文本干脆是空的）才采用
+                if ((-not $text) -or ($ocrText -match '\s' -and $ocrText.Length -ge [Math]::Min(4, $text.Length))) {
+                    $text = $ocrText
+                    $source = 'ocr'
+                    Write-Log ('ocr accepted chars=' + $ocrText.Length + ' box=' + [int]$ocrBox.left + ',' + [int]$ocrBox.top + ',' + [int]$ocrBox.right + ',' + [int]$ocrBox.bottom)
+                }
+            }
         }
     }
     if (-not $text) { return }
@@ -915,6 +1094,68 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
     $appLabel = (Get-ProcessNameOfWindow $hwnd)
     Write-Log ("gesture app=$appLabel source=$source chars=" + $text.Length)
     Start-Translate $text $point.X $point.Y
+}
+
+# ───────────────────────────── OCR 自检（画一张位图再识别） ─────────────────────────────
+
+if ($TestOcr) {
+    $result = @{ ok = $false; engine = $null; english = ''; chinese = ''; error = '' }
+    $bitmap = $null
+    $bitmap2 = $null
+    try {
+        $engine = Initialize-Ocr
+        $result.engine = $(if ($engine) { (($engine | ForEach-Object { $_.RecognizerLanguage.LanguageTag }) -join ',') } else { $null })
+        if (-not $engine) { throw 'OCR engine unavailable' }
+
+        $bitmap = New-Object System.Drawing.Bitmap -ArgumentList 900, 140
+        $g = [System.Drawing.Graphics]::FromImage($bitmap)
+        $g.Clear([System.Drawing.Color]::White)
+        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+        $fontBig = New-Object System.Drawing.Font('Segoe UI', [single](30 * $script:Scale), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+        $fontSmall = New-Object System.Drawing.Font('Segoe UI', [single](22 * $script:Scale), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+        $g.DrawString('The Inner Product', $fontBig, [System.Drawing.Brushes]::Black, 12, 14)
+        $g.DrawString('If u and v are vectors then we regard them as matrices.', $fontSmall, [System.Drawing.Brushes]::Black, 12, 66)
+        $g.Dispose()
+        $result.english = (Invoke-OcrBitmap $bitmap).Trim()
+
+        $bitmap2 = New-Object System.Drawing.Bitmap -ArgumentList 700, 110
+        $g2 = [System.Drawing.Graphics]::FromImage($bitmap2)
+        $g2.Clear([System.Drawing.Color]::White)
+        $g2.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+        $fontZh = New-Object System.Drawing.Font('Microsoft YaHei UI', [single](26 * $script:Scale), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+        $g2.DrawString('内积是两个向量的标量乘积。', $fontZh, [System.Drawing.Brushes]::Black, 12, 24)
+        $g2.Dispose()
+        $result.chinese = (Invoke-OcrBitmap $bitmap2).Trim()
+
+        # 第三张：带选中高亮（浅蓝底黑字）——划词时截到的就是这种图
+        $bitmap3 = New-Object System.Drawing.Bitmap -ArgumentList 900, 90
+        $g3 = [System.Drawing.Graphics]::FromImage($bitmap3)
+        $g3.Clear([System.Drawing.Color]::FromArgb(179, 212, 251))
+        $g3.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+        $fontHi = New-Object System.Drawing.Font('Segoe UI', [single](26 * $script:Scale), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+        $g3.DrawString('The Inner Product', $fontHi, [System.Drawing.Brushes]::Black, 12, 26)
+        $g3.Dispose()
+        $result.highlighted = (Invoke-OcrBitmap $bitmap3).Trim()
+        $result.highlightedOk = ($result.highlighted.Length -ge 10 -and $result.highlighted -match '(?i)roduct')
+        $bitmap3.Dispose()
+
+        # OCR 有噪声（Inner 常被认成 lnner），断言只卡"够长 + 认得出关键词/汉字"
+        $englishOk = ($result.english.Length -ge 20 -and $result.english -match '(?i)roduct')
+        $chineseOk = ($result.chinese -match '[一-鿿]{2,}')
+        $result.englishOk = $englishOk
+        $result.chineseOk = $chineseOk
+        $result.ok = ($englishOk -and $chineseOk -and $result.highlightedOk)
+    } catch {
+        $result.error = $_.Exception.Message
+    } finally {
+        if ($bitmap) { $bitmap.Dispose() }
+        if ($bitmap2) { $bitmap2.Dispose() }
+    }
+    $json = $result | ConvertTo-Json -Depth 4
+    # 同时落一份 UTF-8 文件，避免控制台编码把中文吃掉
+    try { Set-Content -Path (Join-Path $env:TEMP 'dsh-translate-ocr-test.json') -Value $json -Encoding UTF8 } catch { }
+    $json | Write-Output
+    if ($result.ok) { exit 0 } else { exit 1 }
 }
 
 # ───────────────────────────── 浮窗冒烟（画一帧 + 截图） ─────────────────────────────
