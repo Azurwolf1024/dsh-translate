@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Translate (local Ollama)",
+    "description": "Translate input text, page selections and whole files with a local Ollama translation model; each request is stateless and the model is unloaded when idle."
+  }
+}

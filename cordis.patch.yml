@@ -1,0 +1,27 @@
+# dsh-translate bundle 层：一个 Host 行 + 它的 Client 半边（package.json 的 dsh.client）。
+#
+# Host 行为完全由下面的 config 驱动，改这里即改默认值；用户界面里的「设置」页只覆盖
+# 单次会话内的偏好（存 localStorage），不会写回本文件。
+- insert:
+    - id: dsh-translate
+      name: 'dsh-translate'
+      config:
+        # 本地 Ollama 端点；该进程只监听回环地址，翻译请求不离开本机。
+        baseURL: 'http://127.0.0.1:11434'
+        # 翻译专用的本地小模型（Hunyuan-MT2 1.8B，Q6_K，约 1.5 GB）。
+        model: 'kaelri/hy-mt2:1.8b'
+        # 单次生成后模型保持驻留的时长；'0' = 生成结束立即卸载。
+        keepAlive: '5m'
+        # 空闲多久后主动卸载模型（毫秒）。0 = 关闭空闲卸载。
+        idleUnloadMs: 90000
+        # 单次 Ollama 请求超时（毫秒）。
+        timeoutMs: 120000
+        # 一次翻译请求允许的最大字符数。
+        maxTextChars: 20000
+        # 分段长度：超过该长度的文本按段落/句子切分后逐段翻译。
+        chunkChars: 1200
+        # 上传文件体积上限（字节，base64 之前的原始大小）。
+        maxUploadBytes: 12582912
+        # 界面默认值（客户端可覆盖）。
+        defaultTarget: 'auto'
+        tone: 'natural'
