@@ -23,7 +23,8 @@ const PDFJS_ROOT = join(process.cwd(), 'node_modules', 'pdfjs-dist')
 /** 行高/字号推断的通用比例。 */
 const LINE_HEIGHT_RATIO = 1.22
 const PARA_GAP_RATIO = 1.65
-const COLUMN_GAP_MIN = 48
+const MAX_BLOCK_CHARS = 560
+const MAX_BLOCK_HEIGHT_RATIO = 0.32
 
 /* ─────────────────────────── 文本 → 行 / 段 ─────────────────────────── */
 
@@ -67,6 +68,8 @@ export function buildLines(items) {
     if (!item || typeof item.str !== 'string') continue
     const text = item.str
     if (!text) continue
+    // 旋转文字（页边 arXiv 水印之类）：跳过，否则会被当成正文块翻译/覆盖
+    if (item.transform && (Math.abs(item.transform[1]) > 0.01 || Math.abs(item.transform[2]) > 0.01)) continue
     const x = item.transform[4]
     const y = item.transform[5]
     const width = item.width || 0
@@ -119,60 +122,160 @@ export function buildLines(items) {
   return result.filter((line) => line.text)
 }
 
-/** 行 → 段（同栏、行距连续、左边界接近）。 */
-export function groupParagraphs(lines, pageWidth) {
-  const sorted = [...lines].sort((a, b) => (Math.abs(b.y - a.y) > 3 ? b.y - a.y : a.x - b.x))
-  // 栏检测：按左边界聚类，两簇且各自窄于 70% 页宽 → 分栏
-  const lefts = sorted.map((line) => Math.round(line.x / 12) * 12)
-  const counts = new Map()
-  for (const left of lefts) counts.set(left, (counts.get(left) || 0) + 1)
-  const frequent = [...counts.entries()].filter(([, n]) => n >= 2).map(([left]) => left).sort((a, b) => a - b)
-  let columnStarts = []
-  if (frequent.length >= 2) {
-    for (let i = 1; i < frequent.length; i += 1) {
-      if (frequent[i] - frequent[i - 1] > COLUMN_GAP_MIN) columnStarts.push(frequent[i])
+/** 双栏页的分栏位置：用文本片段（不是行）找竖向空白沟——行在双栏页会把左右两栏并成一行。 */
+export function detectColumnGutter(rows, pageWidth) {
+  if (rows.length < 8 || pageWidth < 240) return null
+  let best = null
+  for (let x = pageWidth * 0.28; x <= pageWidth * 0.72; x += 4) {
+    let left = 0
+    let right = 0
+    let crossing = 0
+    for (const line of rows) {
+      if (line.x + line.width <= x) left += 1
+      else if (line.x >= x) right += 1
+      else crossing += 1
+    }
+    const score = Math.min(left, right)
+    if (score >= Math.max(4, rows.length * 0.18) && crossing <= rows.length * 0.12) {
+      if (!best || score > best.score) best = { x, score }
     }
   }
-  const columns = columnStarts.length === 1 ? 2 : 1
-  const medianWidth = median(sorted.map((line) => line.width))
-  if (columns === 2 && medianWidth > pageWidth * 0.62) columnStarts = [] // 宽行说明其实是一栏
+  if (!best) return null
+  const lw = median(rows.filter((line) => line.x + line.width <= best.x).map((line) => line.width))
+  const rw = median(rows.filter((line) => line.x >= best.x).map((line) => line.width))
+  if (!(lw > 0 && rw > 0 && lw < pageWidth * 0.64 && rw < pageWidth * 0.64)) return null
+  return best
+}
 
+function columnOf(line, gutter) {
+  if (!gutter) return 'full'
+  if (line.x + line.width <= gutter.x) return 'left'
+  if (line.x >= gutter.x) return 'right'
+  return 'full'
+}
+
+function canExtend(block, line, maxHeight) {
+  const gap = block.y - (line.y + line.height)
+  const similarSize = Math.abs(line.height - block.height) <= Math.max(2, block.height * 0.35)
+  const aligned = Math.abs(line.x - block.x) <= Math.max(18, block.height * 2.2)
+  const continuous = gap >= -2 && gap <= Math.max(block.height * PARA_GAP_RATIO, block.height + 6)
+  const lastLine = block.lines[block.lines.length - 1]
+  const endsSentence = /[.。!?;：:]["'”’)\]]?\s*$/.test(lastLine ? lastLine.text : '')
+  const limit = endsSentence ? Math.round(MAX_BLOCK_CHARS * 1.6) : MAX_BLOCK_CHARS
+  const charsOk = block.textLen + line.text.length <= limit
+  const heightOk = block.top - line.y <= maxHeight
+  return similarSize && continuous && (aligned || gap < -2) && charsOk && heightOk
+}
+
+function makeBlock(line, column) {
+  return {
+    column,
+    x: line.x,
+    y: line.y,
+    right: line.x + line.width,
+    top: line.y + line.height,
+    height: line.height,
+    textLen: line.text.length,
+    lines: [line],
+  }
+}
+
+function extendBlock(block, line) {
+  block.lines.push(line)
+  block.x = Math.min(block.x, line.x)
+  block.right = Math.max(block.right, line.x + line.width)
+  block.y = Math.min(block.y, line.y)
+  block.top = Math.max(block.top, line.y + line.height)
+  block.height = Math.max(block.height, line.height)
+  block.textLen += line.text.length
+}
+
+/** 按分栏空白沟把文本片段分成左右两栏 + 跨栏片段。 */
+export function partitionByColumn(items, pageWidth) {
+  const usable = (items || []).filter(
+    (item) =>
+      item &&
+      typeof item.str === 'string' &&
+      item.str &&
+      item.transform &&
+      Math.abs(item.transform[1]) <= 0.01 &&
+      Math.abs(item.transform[2]) <= 0.01,
+  )
+  const boxes = usable.map((item) => ({
+    item,
+    x: item.transform[4],
+    width: Math.max(0, item.width || 0),
+  }))
+  const gutter = detectColumnGutter(boxes, pageWidth)
+  if (!gutter) return { full: usable, left: [], right: [] }
+  const left = []
+  const right = []
+  const full = []
+  for (const box of boxes) {
+    if (box.x + box.width <= gutter.x) left.push(box.item)
+    else if (box.x >= gutter.x) right.push(box.item)
+    else full.push(box.item)
+  }
+  return { left, right, full }
+}
+
+/**
+ * 行 → 段。
+ *  · 先找竖向空白沟分出左右栏（XY-cut 的简化版），块不跨栏；全宽行（标题/跨栏公式）单独成块并打断两栏；
+ *  · 块有大小上限（600 字符 / 页高 32%），避免整页正文被并成一块（大输入会让模型截断、丢失内容）。
+ */
+export function groupParagraphs(lines, pageWidth, pageHeight = 0) {
+  const rows = lines.filter((line) => line.text && line.width > 0)
+  const hasColumns = rows.some((line) => line.column)
+  const gutter = hasColumns ? null : detectColumnGutter(rows, pageWidth)
+  const maxHeight = Math.max(120, (pageHeight || 792) * MAX_BLOCK_HEIGHT_RATIO)
+  const sorted = [...rows].sort((a, b) => (Math.abs(b.y - a.y) > 3 ? b.y - a.y : a.x - b.x))
   const blocks = []
-  for (const line of sorted) {
-    const last = blocks[blocks.length - 1]
-    let sameColumn = true
-    if (columnStarts.length && last) {
-      sameColumn = (line.x < columnStarts[0]) === (last.x < columnStarts[0])
+  const current = { left: null, right: null, full: null }
+  const flush = (key) => {
+    if (current[key]) {
+      blocks.push(current[key])
+      current[key] = null
     }
-    if (!last || !sameColumn) {
-      blocks.push(createBlock(line))
+  }
+  for (const line of sorted) {
+    const column = line.column || columnOf(line, gutter)
+    if (column === 'full') {
+      // 全宽行（标题/跨栏公式/图注）打断左右栏
+      flush('left')
+      flush('right')
+      if (current.full && canExtend(current.full, line, maxHeight)) extendBlock(current.full, line)
+      else {
+        flush('full')
+        current.full = makeBlock(line, 'full')
+      }
       continue
     }
-    const gap = last.y - (line.y + line.height)
-    const similarSize = Math.abs(line.height - last.height) <= Math.max(2, last.height * 0.35)
-    const aligned = Math.abs(line.x - last.x) <= Math.max(18, last.height * 2.2)
-    const continuous = gap >= -2 && gap <= Math.max(last.height * PARA_GAP_RATIO, last.height + 6)
-    if (similarSize && (aligned || gap < -2) && continuous) {
-      last.lines.push(line)
-      last.x = Math.min(last.x, line.x)
-      last.right = Math.max(last.right, line.x + line.width)
-      last.y = Math.min(last.y, line.y)
-      last.top = Math.max(last.top, line.y + line.height)
-      last.height = Math.max(last.height, line.height)
-    } else {
-      blocks.push(createBlock(line))
+    flush('full')
+    if (current[column] && canExtend(current[column], line, maxHeight)) extendBlock(current[column], line)
+    else {
+      flush(column)
+      current[column] = makeBlock(line, column)
     }
   }
+  flush('left')
+  flush('right')
+  flush('full')
+
+  // 阅读顺序：自上而下；同一高度左栏先于右栏，全宽块居中处理
+  const order = { left: 0, full: 1, right: 2 }
+  blocks.sort((a, b) => (Math.abs(a.y - b.y) > 6 ? b.y - a.y : order[a.column] - order[b.column]))
 
   return blocks.map((block, index) => {
     const joined = block.lines.map((line) => line.text).join(' ')
     const text = joined
-      .replace(/([a-z])-\s+([a-z])/g, '$1$2') // 断词连字符
+      .replace(/([a-z])-\s+([a-z])/g, '$1$2')
       .replace(/\s+/g, ' ')
       .trim()
     return {
       id: `b${index}`,
       text,
+      column: block.column,
       x: round2(block.x),
       y: round2(block.y),
       width: round2(block.right - block.x),
@@ -182,17 +285,6 @@ export function groupParagraphs(lines, pageWidth) {
       translatable: isTranslatable(text),
     }
   })
-}
-
-function createBlock(line) {
-  return {
-    x: line.x,
-    y: line.y,
-    right: line.x + line.width,
-    top: line.y + line.height,
-    height: line.height,
-    lines: [line],
-  }
 }
 
 function round2(value) {
@@ -224,8 +316,14 @@ export async function readPdfBlocks(bytes, options = {}) {
     const page = await doc.getPage(index)
     const viewport = page.getViewport({ scale: 1 })
     const content = await page.getTextContent()
-    const lines = buildLines(content.items)
-    const blocks = groupParagraphs(lines, viewport.width)
+    // 先按栏切片段，再各自聚行：同一基线的左右两栏不能进同一行
+    const parts = partitionByColumn(content.items, viewport.width)
+    const lines = []
+    for (const column of ['left', 'right', 'full']) {
+      if (!parts[column] || parts[column].length === 0) continue
+      for (const line of buildLines(parts[column])) lines.push({ ...line, column })
+    }
+    const blocks = groupParagraphs(lines, viewport.width, viewport.height)
     pages.push({
       index: index - 1,
       width: round2(viewport.width),
@@ -312,32 +410,50 @@ function wrapText(text, font, size, maxWidth) {
 
 const MIN_FONT_SIZE = 6
 
-/** 在给定矩形内放下译文：从原字号开始逐级缩小，返回 { lines, size, lineHeight }。 */
+/** 在给定矩形内放下译文：从原字号开始逐级缩小；实在放不下就截断到可用高度并标 overflow。 */
 function layoutFit(text, font, boxWidth, boxHeight, startSize) {
-  // 字号下限：不低于原字号的 55%，否则页面会变成密密麻麻的小字
   const floor = Math.max(MIN_FONT_SIZE, startSize * 0.55)
-  let size = Math.max(floor, Math.min(startSize, boxHeight))
+  let size = Math.max(floor, Math.min(startSize, Math.max(boxHeight, startSize)))
   for (; size >= floor; size -= 0.5) {
     const lineHeight = size * LINE_HEIGHT_RATIO
     const lines = wrapText(text, font, size, Math.max(8, boxWidth))
     if (lines.length * lineHeight <= boxHeight + 0.5) {
-      return { lines, size, lineHeight }
+      return { lines, size, lineHeight, overflow: false }
     }
   }
-  // 实在放不下：用下限字号画出来（允许向下溢出，至少内容完整、能读）
   const lineHeight = floor * LINE_HEIGHT_RATIO
-  return { lines: wrapText(text, font, floor, Math.max(8, boxWidth)), size: floor, lineHeight }
+  const all = wrapText(text, font, floor, Math.max(8, boxWidth))
+  const keep = Math.max(1, Math.floor(boxHeight / lineHeight))
+  const lines = all.slice(0, keep)
+  if (all.length > keep && lines.length) {
+    lines[lines.length - 1] = lines[lines.length - 1].replace(/\s+$/, '') + '…'
+  }
+  return { lines, size: floor, lineHeight, overflow: all.length > keep }
+}
+
+/** 每块下方可用高度：到「同栏下一块顶部」的距离（没有下一块就用页底留白）。 */
+function computeAvailabilities(page) {
+  const blocks = page.blocks || []
+  const map = new Map()
+  for (const block of blocks) {
+    const top = block.y + block.height
+    let nearestTop = null
+    for (const other of blocks) {
+      if (other === block) continue
+      const otherTop = other.y + other.height
+      if (otherTop >= top - 1) continue
+      const overlap = Math.min(block.x + block.width, other.x + other.width) - Math.max(block.x, other.x)
+      if (overlap < Math.min(block.width, other.width) * 0.3) continue
+      if (nearestTop === null || otherTop > nearestTop) nearestTop = otherTop
+    }
+    map.set(block.id, top - (nearestTop === null ? 12 : nearestTop))
+  }
+  return map
 }
 
 /**
- * 生成输出 PDF。
- * @param {object} input
- * @param {Uint8Array} input.bytes 原 PDF
- * @param {Array} input.pages readPdfBlocks 的 pages（含 blocks）
- * @param {Map<string,string>|object} input.translations blockId → 译文
- * @param {'overlay'|'dual'} input.mode
- * @param {object} input.font { bytes }
- * @param {object} input.options { background:[r,g,b], textColor:[r,g,b], minFontSize }
+ * 生成输出 PDF，并返回排版统计（供 QC / UI 提示）。
+ * @returns {Promise<{bytes: Uint8Array, stats: object}>}
  */
 export async function buildBilingualPdf(input) {
   const { bytes, pages, mode = 'overlay', font, options = {} } = input
@@ -350,8 +466,53 @@ export async function buildBilingualPdf(input) {
   const pageMap = new Map((pages || []).map((page) => [page.index, page]))
   const background = rgb(...(options.background || [1, 1, 1]))
   const textColor = rgb(...(options.textColor || [0, 0, 0]))
-
   const shouldTranslate = (block) => block.translatable !== false
+  const stats = { blocks: 0, translated: 0, skipped: 0, empty: 0, overflow: [], overlaps: [] }
+
+  const drawPage = ({ page, info, font: cjk, background: fillDefault, allowCover }) => {
+    const availabilities = computeAvailabilities(info)
+    const rects = []
+    for (const block of info.blocks || []) {
+      const text = getTranslation(info.index, block)
+      const translatable = shouldTranslate(block)
+      stats.blocks += 1
+      if (!translatable) {
+        stats.skipped += 1
+        continue
+      }
+      if (!text) {
+        stats.empty += 1
+        continue
+      }
+      let fill = fillDefault
+      if (allowCover && fill && options.sampleBackground && options.pageSamples && options.pageSamples[info.index]) {
+        const sampled = sampleBackgroundColor(options.pageSamples[info.index], block, info)
+        if (sampled) fill = sampled
+      }
+      const drawn = drawBlock({
+        page,
+        block,
+        text,
+        font: cjk,
+        color: textColor,
+        background: allowCover ? fill : null,
+        maxHeight: availabilities.get(block.id),
+      })
+      stats.translated += 1
+      if (drawn.overflow) stats.overflow.push({ page: info.index, id: block.id })
+      rects.push(drawn)
+    }
+    // 重叠检测（只在同一页内、面积足够大的相交才算）
+    for (let i = 0; i < rects.length; i += 1) {
+      for (let j = i + 1; j < rects.length; j += 1) {
+        const a = rects[i]
+        const b = rects[j]
+        const ox = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x)
+        const oy = Math.min(a.top, b.top) - Math.max(a.bottom, b.bottom)
+        if (ox > 6 && oy > 6) stats.overlaps.push({ page: info.index, a: i, b: j })
+      }
+    }
+  }
 
   if (mode === 'dual') {
     const source = await PDFDocument.load(bytes, { ignoreEncryption: true })
@@ -368,38 +529,22 @@ export async function buildBilingualPdf(input) {
       if (!page || !page.blocks || page.blocks.length === 0) continue
       const translated = out.addPage([width, height])
       translated.drawRectangle({ x: 0, y: 0, width, height, color: background })
-      for (const block of page.blocks) {
-        if (!shouldTranslate(block)) continue
-        const text = getTranslation(index, block)
-        if (!text) continue
-        drawBlock({ page: translated, block, text, font: cjk, color: textColor, background: null })
-      }
+      drawPage({ page: translated, info: page, font: cjk, background: null, allowCover: false })
     }
-    return out.save()
+    return { bytes: await out.save(), stats }
   }
 
-  // 覆盖模式：直接在原页上盖白块 + 写译文
+  // 覆盖模式：直接在原页上盖底色 + 写译文
   const doc = await PDFDocument.load(bytes, { ignoreEncryption: true })
   doc.registerFontkit(fontkit)
   const cjk = await doc.embedFont(font.bytes, { subset: true })
   const docPages = doc.getPages()
   for (let index = 0; index < docPages.length; index += 1) {
-    const page = docPages[index]
     const info = pageMap.get(index)
-    if (!info) continue
-    for (const block of info.blocks) {
-      if (!shouldTranslate(block)) continue
-      const text = getTranslation(index, block)
-      if (!text) continue
-      let fill = background
-      if (options.sampleBackground && options.pageSamples && options.pageSamples[index]) {
-        const sampled = sampleBackgroundColor(options.pageSamples[index], block, info)
-        if (sampled) fill = sampled
-      }
-      drawBlock({ page, block, text, font: cjk, color: textColor, background: fill })
-    }
+    if (!info || !info.blocks || info.blocks.length === 0) continue
+    drawPage({ page: docPages[index], info, font: cjk, background, allowCover: true })
   }
-  return doc.save()
+  return { bytes: await doc.save(), stats }
 }
 
 /** 从页面位图（RGBA）采样块周围的底色，取众数；失败返回 null。 */
@@ -488,27 +633,38 @@ export function blocksFromOcrLines(lines, pageWidth, pageHeight, scale = 2) {
   }))
 }
 
-function drawBlock({ page, block, text, font, color, background }) {
+function drawBlock({ page, block, text, font, color, background, maxHeight }) {
   const padX = Math.max(0.6, block.fontSize * 0.12)
   const boxX = block.x - padX
-  const boxY = block.y - block.fontSize * 0.22
   const boxWidth = block.width + padX * 2
-  const boxHeight = block.height + block.fontSize * 0.42
+  const top = block.y + block.height + 1
+  const space = Math.max(block.height + 2, maxHeight || block.height + 8)
+  const layout = layoutFit(text, font, boxWidth, space, block.fontSize)
+  let cursor = top - layout.size
   if (background) {
-    // 稍微外扩，盖住原文字形的抗锯齿边缘
+    // 盖住「原文块 + 实际译文占用的高度」——只按原文块大小盖，会露出溢出的原文，形成叠字
+    const bottom = cursor - (layout.lines.length - 1) * layout.lineHeight + layout.size * 0.25
+    const rectTop = top + block.fontSize * 0.35
+    const rectBottom = Math.min(block.y - block.fontSize * 0.42, bottom - 1.2)
     page.drawRectangle({
       x: boxX - 0.8,
-      y: boxY - 0.4,
+      y: rectBottom,
       width: boxWidth + 1.6,
-      height: boxHeight + 0.8,
+      height: Math.max(2, rectTop - rectBottom),
       color: background,
     })
   }
-  const layout = layoutFit(text, font, boxWidth, boxHeight, block.fontSize)
-  let cursor = boxY + boxHeight - layout.size
   for (const line of layout.lines) {
     page.drawText(line, { x: boxX, y: cursor, size: layout.size, font, color })
     cursor -= layout.lineHeight
+  }
+  const bottom = cursor + layout.lineHeight
+  return {
+    x: boxX,
+    width: boxWidth,
+    top,
+    bottom: Math.min(bottom, block.y),
+    overflow: layout.overflow,
   }
 }
 

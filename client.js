@@ -1594,6 +1594,9 @@ window.__ModuleLoader__.load({
 			var resultPair = useState(null);
 			var result = resultPair[0];
 			var setResult = resultPair[1];
+			var qcPair = useState(null);
+			var qc = qcPair[0];
+			var setQc = qcPair[1];
 			var modePair = useState('overlay');
 			var mode = modePair[0];
 			var setMode = modePair[1];
@@ -1701,6 +1704,7 @@ window.__ModuleLoader__.load({
 						}
 					}
 					setProgress({ done: 0, total: todo.length });
+					var failedBlocks = 0;
 					for (var t = 0; t < todo.length; t += 1) {
 						if (control.signal.aborted) throw new Error('已取消');
 						var item = todo[t];
@@ -1716,7 +1720,12 @@ window.__ModuleLoader__.load({
 							},
 							control.signal
 						);
-						translationsRef.current[item.page + ':' + item.block.id] = response.text;
+						if (response.degraded && response.degraded.length) {
+							// 译文校验没过：保留原文，不再把英文/半截译文画上去
+							failedBlocks += 1;
+						} else {
+							translationsRef.current[item.page + ':' + item.block.id] = response.text;
+						}
 						if ((t + 1) % 3 === 0 || t + 1 === todo.length) setProgress({ done: t + 1, total: todo.length });
 					}
 
@@ -1752,6 +1761,12 @@ window.__ModuleLoader__.load({
 					);
 					var output = built.dataBase64;
 					setResult({ bytes: built.bytes, mode: built.mode });
+					setQc({
+						failed: failedBlocks,
+						translated: built.stats ? built.stats.translated : 0,
+						overflow: built.stats ? built.stats.overflow.length : 0,
+						overlaps: built.stats ? built.stats.overlaps.length : 0
+					});
 					setPhase('done');
 					download(baseName(file.name) + (mode === 'dual' ? '.双语对照.pdf' : '.译文.pdf'), output);
 					refreshStatus();
@@ -1856,6 +1871,16 @@ window.__ModuleLoader__.load({
 					)
 				),
 				error ? h('div', { className: 'dstr-error', style: { marginTop: '12px' } }, error) : null,
+				qc
+					? h(
+							'div',
+							{ className: 'dstr-hint', style: { marginTop: '10px' } },
+							'已翻译 ' + qc.translated + ' 块' +
+								(qc.failed ? ' · ' + qc.failed + ' 块译文校验未通过（已保留原文）' : '') +
+								(qc.overflow ? ' · ' + qc.overflow + ' 块排版溢出（已截断）' : '') +
+								(qc.overlaps ? ' · ' + qc.overlaps + ' 处重叠' : '')
+						)
+					: null,
 				h(
 					'div',
 					{ className: 'dstr-file-bar' },

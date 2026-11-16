@@ -977,46 +977,103 @@ async function sweepIdle(state) {
 
 /* ─────────────────────────────── 翻译主流程 ─────────────────────────────── */
 
+/** 译文“没翻好”的判定：目标中文却几乎没有汉字，或长度明显短于原文。 */
+export function looksUntranslated(raw, target, source) {
+  if (!/^zh/i.test(String(target || ''))) return false
+  const src = String(source || '')
+  if (/[一-鿿]/.test(src)) return false
+  if (!/[A-Za-z]/.test(src)) return false
+  const text = String(raw || '')
+  const plain = text.replace(/\s+/g, '')
+  if (!plain) return true
+  const cjk = (plain.match(/[一-鿿]/g) || []).length
+  // 只判断「有没有真的翻成中文」：中文比英文短是正常的（约 0.3~0.5 倍），不能再按长度卡
+  if (cjk / plain.length < 0.15) return true
+  return false
+}
+
+const STRICT_SUFFIX =
+  '你必须输出目标语言的译文：只输出译文本身，不要复制原文、不要解释、不要保留整段英文。'
+
+/** 翻一段，并校验结果；不通过就用更严格的提示重试一次。 */
+async function translateOne({ cfg, signal, system, target, text }) {
+  let last = ''
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const messages = [
+      { role: 'system', content: attempt === 0 ? system : `${system} ${STRICT_SUFFIX}` },
+      {
+        role: 'user',
+        content: attempt === 0 ? text : `把下面这段文字翻译成目标语言，只输出译文（不要输出原文）：
+
+${text}`,
+      },
+    ]
+    const raw = await chatOnce({ cfg, signal, numPredict: Math.ceil(text.length * 2.2), messages })
+    last = postProcess(raw, text)
+    if (!looksUntranslated(last, target, text)) return { text: last, ok: true }
+  }
+  return { text: last, ok: false }
+}
+
+/** 长段落在句子边界一分为二（校验失败时用，避免整段被模型摘要/截断）。 */
+function splitInHalf(text) {
+  const middle = Math.floor(text.length / 2)
+  let cut = -1
+  const NEWLINE = String.fromCharCode(10)
+  for (const mark of ['. ', '。 ', '? ', '! ', NEWLINE]) {
+    const index = text.lastIndexOf(mark, middle + 60)
+    if (index > text.length * 0.25 && index < text.length * 0.75) {
+      cut = index + mark.length
+      break
+    }
+  }
+  if (cut < 0) cut = middle
+  return [text.slice(0, cut), text.slice(cut)]
+}
+
 async function translateSegments({ state, cfg, segments, spec, signal }) {
   const target = resolveTarget(spec.targetLanguage, spec.text, cfg.defaultTarget === 'auto' ? 'zh-Hans' : cfg.defaultTarget)
   const system = buildSystemPrompt({ targetLanguage: target, tone: spec.tone || cfg.tone, glossary: spec.glossary })
   const outputs = []
+  const degraded = []
   let translated = 0
   for (const segment of segments) {
     if (segment.kind === 'code') {
       outputs.push(segment.text)
       continue
     }
-    let attempt = 0
-    let lastError = null
-    while (attempt < 2) {
-      try {
-        const raw = await chatOnce({
-          cfg,
-          signal,
-          numPredict: Math.ceil(segment.text.length * 1.8),
-          messages: [
-            { role: 'system', content: system },
-            { role: 'user', content: segment.text },
-          ],
-        })
-        outputs.push(postProcess(raw, segment.text))
-        lastError = null
-        break
-      } catch (error) {
-        lastError = error
-        if (error?.code === 'CANCELLED' || error?.code === 'TIMEOUT') throw error
-        attempt += 1
-        if (attempt >= 2) throw error
-        await new Promise((resolve) => setTimeout(resolve, 400))
+    let result
+    try {
+      result = await translateOne({ cfg, signal, system, target, text: segment.text })
+      if (!result.ok && segment.text.length > 240) {
+        // 校验失败的长段：二分重译（每半段走同样的校验+重试）
+        const halves = splitInHalf(segment.text)
+        const parts = []
+        let allOk = true
+        for (const half of halves) {
+          if (!half.trim()) continue
+          const halfResult = await translateOne({ cfg, signal, system, target, text: half })
+          if (!halfResult.ok) allOk = false
+          parts.push(halfResult.text)
+        }
+        if (parts.length) {
+          result = { text: parts.join(''), ok: allOk }
+        }
       }
+    } catch (error) {
+      if (error?.code === 'CANCELLED' || error?.code === 'TIMEOUT') throw error
+      throw error
     }
-    if (lastError) throw lastError
+    if (!result.ok) {
+      degraded.push({ index: outputs.length, chars: segment.text.length, reason: 'untranslated' })
+      state.log('warn', `译文校验未通过（${segment.text.length} 字符），保留原文`)
+    }
+    outputs.push(result.text)
     translated += 1
     state.touchedModels.add(cfg.model)
     state.lastActivity = Date.now()
   }
-  return { text: assembleSegments(segments, outputs), translated, targetLanguage: target }
+  return { text: assembleSegments(segments, outputs), translated, degraded, targetLanguage: target }
 }
 
 /* ─────────────────────────────── HTTP 路由 ─────────────────────────────── */
@@ -1297,9 +1354,10 @@ async function handleAction(state, body, signal) {
     return {
       ok: true,
       mode,
-      bytes: output.length,
+      bytes: output.bytes.length,
       pageCount: Array.isArray(body.pages) ? body.pages.length : 0,
-      dataBase64: Buffer.from(output).toString('base64'),
+      stats: output.stats,
+      dataBase64: Buffer.from(output.bytes).toString('base64'),
     }
   }
 
@@ -1396,7 +1454,14 @@ async function handleAction(state, body, signal) {
       signal,
     })
     state.lastActivity = Date.now()
-    return { ok: true, text: result.text, targetLanguage: result.targetLanguage, chunks: segments.length, ms: Date.now() - started }
+    return {
+      ok: true,
+      text: result.text,
+      targetLanguage: result.targetLanguage,
+      chunks: segments.length,
+      degraded: result.degraded || [],
+      ms: Date.now() - started,
+    }
   }
 
   throw new TranslateError('BAD_REQUEST', `未知动作：${action || '(空)'}`)

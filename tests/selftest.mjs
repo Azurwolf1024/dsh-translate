@@ -12,7 +12,7 @@ import { EventEmitter } from 'node:events'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { apply, __internal, ROUTE_PATH } from '../index.js'
+import { apply, __internal, looksUntranslated, ROUTE_PATH } from '../index.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const fixtures = join(here, 'fixtures')
@@ -273,9 +273,9 @@ if (fontInfo) {
     font: fontInfo,
     options: {},
   })
-  check('覆盖模式生成了 PDF', overlayPdf.length > fixturePdf.length, `${overlayPdf.length} bytes`)
+  check('覆盖模式生成了 PDF', overlayPdf.bytes.length > fixturePdf.length, `${overlayPdf.bytes.length} bytes`)
   const checkDoc = await import('pdfjs-dist/legacy/build/pdf.mjs')
-  const checkLoaded = await checkDoc.getDocument({ data: new Uint8Array(overlayPdf), standardFontDataUrl: '' }).promise
+  const checkLoaded = await checkDoc.getDocument({ data: new Uint8Array(overlayPdf.bytes), standardFontDataUrl: '' }).promise
   const outPage = await checkLoaded.getPage(1)
   const outContent = await outPage.getTextContent()
   const outText = outContent.items.map((item) => item.str).join('')
@@ -290,10 +290,61 @@ if (fontInfo) {
     font: fontInfo,
     options: {},
   })
-  const dualDoc = await checkDoc.getDocument({ data: new Uint8Array(dualPdf), standardFontDataUrl: '' }).promise
+  const dualDoc = await checkDoc.getDocument({ data: new Uint8Array(dualPdf.bytes), standardFontDataUrl: '' }).promise
   check('对照模式是原文页 + 译文页', dualDoc.numPages === 2, String(dualDoc.numPages))
+  check('排版统计：翻译块数 > 0 且无重叠', dualPdf.stats.translated > 0 && dualPdf.stats.overlaps.length === 0, JSON.stringify(dualPdf.stats))
   await dualDoc.destroy()
 }
+
+// 分块：块大小上限（整页正文不能被并成一块）
+const syntheticLines = []
+for (let i = 0; i < 60; i += 1) {
+  syntheticLines.push({
+    text: `line ${i} of a long single column paragraph with several words to exceed the cap`,
+    x: 50,
+    y: 700 - i * 12,
+    width: 400,
+    height: 9,
+  })
+}
+const cappedBlocks = pdfModule.groupParagraphs(syntheticLines, 612, 792)
+check(
+  '单栏长正文按上限切块（<=900 字符，句子边界可放宽）',
+  cappedBlocks.length > 1 && cappedBlocks.every((block) => block.text.length <= 900),
+  `blocks=${cappedBlocks.length} max=${Math.max(...cappedBlocks.map((block) => block.text.length))}`
+)
+
+// 分栏：左右两栏的片段要分开（否则两栏文本会被并成一行、顺序错乱）
+const twoColumnItems = []
+for (let i = 0; i < 12; i += 1) {
+  const y = 700 - i * 14
+  twoColumnItems.push({ str: `Left column line ${i}`, width: 200, transform: [1, 0, 0, 1, 46, y] })
+  twoColumnItems.push({ str: `Right column line ${i}`, width: 200, transform: [1, 0, 0, 1, 310, y] })
+}
+const parts = pdfModule.partitionByColumn(twoColumnItems, 612)
+check(
+  '双栏片段按空白沟分开',
+  parts.left.length >= 10 && parts.right.length >= 10 && parts.full.length === 0,
+  `left=${parts.left.length} right=${parts.right.length} full=${parts.full.length}`
+)
+
+// 译文校验：英文原样返回要被判失败，中文译文要放行
+check(
+  '译文校验：英文原样返回判为未翻译',
+  looksUntranslated('For robots to be useful, they must possess skills.', 'zh-Hans', 'For robots to be useful, they must possess skills.') === true
+)
+check(
+  '译文校验：中文译文放行',
+  looksUntranslated('为了使机器人有用，它们必须具备技能。', 'zh-Hans', 'For robots to be useful, they must possess skills.') === false
+)
+check(
+  '译文校验：原文已是中文时不判失败',
+  looksUntranslated('已经是中文', 'zh-Hans', '已经是中文') === false
+)
+check(
+  '译文校验：非中文目标不启用',
+  looksUntranslated('For robots to be useful.', 'en', '这是一段中文原文') === false
+)
 
 const routePdf = await callRoute(route, {
   body: JSON.stringify({ action: 'pdfExtract', name: 'fixture.pdf', dataBase64: Buffer.from(fixturePdf).toString('base64') }),
