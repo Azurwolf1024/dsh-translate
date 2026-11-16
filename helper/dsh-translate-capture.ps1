@@ -38,7 +38,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '1.5.1'
+$script:ScriptVersion = '1.5.2'
 $script:ThemePath = $ThemePath
 
 # ───────────────────────────── 日志 ─────────────────────────────
@@ -135,6 +135,7 @@ $script:BodyLineHeight = 16
 $script:ScrollOffset = 0
 $script:LastSource = ''
 $script:PendingGesture = $null
+$script:GestureClipSeq = 0
 $script:OcrEngine = $null
 $script:OcrReady = 0
 $script:Anchor = $null
@@ -429,6 +430,15 @@ function Get-SelectionViaUia([System.Windows.Point]$point) {
 }
 
 # ───────────────────────────── 取词：剪贴板兜底 ─────────────────────────────
+
+function Read-ClipboardText() {
+    try {
+        if ([System.Windows.Forms.Clipboard]::ContainsText()) {
+            return ([System.Windows.Forms.Clipboard]::GetText())
+        }
+    } catch { }
+    return ''
+}
 
 function Send-CtrlC() {
     $scanC = [byte][DTWin32]::MapVirtualKey(0x43, 0)
@@ -1039,8 +1049,8 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
     # 先 Trim 再判断有没有词间空白（PDF 选区常以 CRLF 结尾）
     if ($text) { $text = $text.Trim() }
 
-    $looksLikeBrokenLatin = ($text -and $text -match '[A-Za-z]' -and $text -notmatch '[\u4e00-\u9fff]' -and $text -notmatch '\s' -and $text.Length -ge 8)
-    $ocrHasSpaces = $false
+    $wordsInLatin = { param($value) $value -and $value -match '[A-Za-z]' -and $value -notmatch '[\u4e00-\u9fff]' -and $value -notmatch '\s' -and $value.Length -ge 8 }
+    $needsHelp = (-not $text) -or (& $wordsInLatin $text)
     $ocrBox = $null
     if ($script:Anchor) {
         $ocrBox = $script:Anchor
@@ -1053,37 +1063,45 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
         }
     }
 
-    # 需要 OCR 的两类情况：完全没文字（图片型 PDF / 扫描件）、拉丁文本丢了空格或被截断了首字。
-    # 这里不再为了补空格去注入 Ctrl+C —— 那会干扰用户自己的复制。
-    if ($ocrBox -and (-not $text -or $looksLikeBrokenLatin)) {
-        $ocrText = ''
-        try { $ocrText = Get-TextViaOcr $ocrBox.left $ocrBox.top $ocrBox.right $ocrBox.bottom } catch { $ocrText = '' }
-        if ($ocrText) { $ocrText = $ocrText.Trim() }
-        if ($ocrText) {
-            $ocrHasSpaces = ($ocrText -match '\s')
-            if (-not $text) {
-                $text = $ocrText
-                $source = 'ocr'
-            } elseif ($ocrHasSpaces -and $ocrText.Length -ge [Math]::Max(4, [int]($text.Length * 0.5))) {
-                # UIA 粘成一串 / 少了首字母时，OCR 通常更准（它按画面读，不会丢空格和字）
-                $text = $ocrText
-                $source = 'uia+ocr'
+    if ($needsHelp) {
+        # ── 第二层：剪贴板 ──
+        # 1) 用户在这次手势之前/期间自己复制过（剪贴板序号变了）→ 直接读，**绝不注入**，零打扰
+        # 2) 否则才注入一次 Ctrl+C：注入前保存、读完还原；只还原自己写的那次；按住 Ctrl 时不注入
+        $currentSeq = [DTWin32]::GetClipboardSequenceNumber()
+        $userCopied = ($script:GestureClipSeq -gt 0 -and $currentSeq -ne $script:GestureClipSeq)
+        if ($userCopied) {
+            # 用户自己已经复制过：直接读，不注入（零打扰，也不改他的剪贴板）
+            $clipText = Read-ClipboardText
+            if ($clipText) {
+                $text = $clipText.Trim()
+                $source = 'clipboard-passive'
+            }
+        } elseif ($AllowClipboard -and (([DTWin32]::GetAsyncKeyState(0x11) -band 0x8000) -eq 0)) {
+            # 需要主动取词时才注入一次（存还原只针对自己写的那次）
+            $clipText = ''
+            try { $clipText = Get-SelectionViaClipboard ($hwnd) } catch { $clipText = '' }
+            if ($clipText) {
+                $text = $clipText.Trim()
+                $source = 'clipboard'
             }
         }
-        if ($source -eq 'uia' -and -not $ocrHasSpaces -and $looksLikeBrokenLatin) {
-            $text = Restore-WordSpacing $text
-            $source = 'uia-respaced'
-        }
-    }
 
-    # 兜底顺序里剪贴板默认关闭：只有显式开启、且 UIA 完全没拿到文字时才用一次
-    if (-not $text -and $AllowClipboard) {
-        $source = 'clipboard'
-        try { $text = Get-SelectionViaClipboard ($hwnd) } catch { $text = '' }
-        if ($text) { $text = $text.Trim() }
-        if ($text -and $text -notmatch '\s' -and $text.Length -ge 8) {
+        # ── 第三层：OCR（剪贴板也没拿到，或拿到的仍是粘成一串的文本）──
+        $stillBroken = (-not $text) -or (& $wordsInLatin $text)
+        if ($stillBroken -and $ocrBox) {
+            $ocrText = ''
+            try { $ocrText = Get-TextViaOcr $ocrBox.left $ocrBox.top $ocrBox.right $ocrBox.bottom } catch { $ocrText = '' }
+            if ($ocrText) { $ocrText = $ocrText.Trim() }
+            if ($ocrText -and ($ocrText -match '\s') -and $ocrText.Length -ge [Math]::Max(4, [int]([Math]::Max(1, $text.Length) * 0.5))) {
+                $text = $ocrText
+                $source = $(if ($source -like 'clipboard*') { 'clipboard+ocr' } else { 'ocr' })
+            }
+        }
+
+        # 仍然粘在一起：按大小写边界补空格（最后一道）
+        if ($text -and (& $wordsInLatin $text)) {
             $text = Restore-WordSpacing $text
-            $source = 'clipboard-respaced'
+            $source = $source + '-respaced'
         }
     }
 
@@ -1449,6 +1467,8 @@ try {
         if ($down -and -not $script:LeftDown) {
             $script:DownPoint = $pos
             $script:DownAt = $now
+            # 手势开始时记一次剪贴板序号：之后若变了，说明用户自己按了 Ctrl+C
+            try { $script:GestureClipSeq = [DTWin32]::GetClipboardSequenceNumber() } catch { $script:GestureClipSeq = 0 }
         }
         if (-not $down -and $script:LeftDown) {
             $moved = 0

@@ -616,8 +616,8 @@ export const DEFAULTS = Object.freeze({
   maxPdfBytes: 60 * 1024 * 1024,
   /** 生成双语 PDF 用的中文字体路径（留空 = 自动找系统字体）。 */
   pdfFont: '',
-  /** 系统级划译的剪贴板兜底：默认关（注入 Ctrl+C 会干扰用户自己的复制）。 */
-  clipboardFallback: false,
+  /** 系统级划译的剪贴板层：true = 允许在需要时注入一次 Ctrl+C（默认）；false = 只被动读、绝不注入。 */
+  clipboardFallback: true,
   defaultTarget: 'auto',
   tone: 'natural',
 })
@@ -645,7 +645,7 @@ export function normalizeConfig(raw) {
     maxUploadBytes: numberOr(input.maxUploadBytes, DEFAULTS.maxUploadBytes, 1024, 64 * 1024 * 1024),
     maxPdfBytes: numberOr(input.maxPdfBytes, DEFAULTS.maxPdfBytes, 1024 * 1024, 256 * 1024 * 1024),
     pdfFont: typeof input.pdfFont === 'string' ? input.pdfFont : DEFAULTS.pdfFont,
-    clipboardFallback: input.clipboardFallback === true,
+    clipboardFallback: input.clipboardFallback !== false,
     defaultTarget: LANGS[target] || target === 'auto' ? target : DEFAULTS.defaultTarget,
     tone: TONES[String(input.tone || '')] ? String(input.tone) : DEFAULTS.tone,
     temperature: numberOr(input.temperature, 0.2, 0, 1.5),
