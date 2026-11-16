@@ -1,6 +1,6 @@
 {
   "name": "dsh-translate",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Translate with a local Ollama model inside DeepSeek Harness: in-page selection popup, system-wide selection (UI Automation -> clipboard -> OCR fallback), text and file translation. Stateless requests, unloads the model when idle.",
   "type": "module",
   "main": "./index.js",
@@ -13,6 +13,7 @@
   },
   "files": [
     "index.js",
+    "pdf.js",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
@@ -70,5 +71,13 @@
     "selftest:helper": "powershell -NoProfile -STA -ExecutionPolicy Bypass -File helper/dsh-translate-capture.ps1 -SelfTest",
     "selftest:ocr": "powershell -NoProfile -STA -ExecutionPolicy Bypass -File helper/dsh-translate-capture.ps1 -TestOcr",
     "selftest:overlay": "powershell -NoProfile -STA -ExecutionPolicy Bypass -File helper/dsh-translate-capture.ps1 -TestOverlay"
+  },
+  "dependencies": {
+    "pdfjs-dist": "^4.10.38",
+    "pdf-lib": "^1.17.1",
+    "@pdf-lib/fontkit": "^1.1.1"
+  },
+  "devDependencies": {
+    "@napi-rs/canvas": "^0.1.65"
   }
 }

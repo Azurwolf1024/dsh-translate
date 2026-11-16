@@ -2,6 +2,20 @@
 
 本项目从「个人可用的翻译插件」演进到「可分享安装」的过程记录。版本号与 `package.json` 同步。
 
+## 1.5.0 — PDF 翻译（覆盖 / 对照 + OCR）
+
+- 新增 PDF 翻译：`pdf.js` 取文字层与坐标 → 聚段落（轻量 IR）→ 逐块翻译 → `pdf-lib` 写回
+  - **覆盖模式（默认）**：原位盖掉原文写译文，版式/分页不变
+  - **对照模式**：每页原文后插入同版式译文页
+  - 公式/矩阵/代码块启发式识别后**保留原文不译**
+  - 扫描页（无文本层）先 OCR（Windows 自带引擎），返回带坐标的行再排版
+- 依赖：`pdfjs-dist` / `pdf-lib` / `@pdf-lib/fontkit`（纯 JS，由插件安装时拉取）；
+  浏览器端 pdf.js 产物由 Host 新增的 `/dsh-translate/assets/*` 路由提供（前缀路由不带结尾斜杠）
+- 中文字体：自动探测系统单文件 TTF（Windows 等线 `Deng.ttf`），可用配置 `pdfFont` 覆盖；TTC 不支持
+- 新增配置 `maxPdfBytes`（60 MB）与 `pdfFont`；请求体上限随 PDF 上限放大
+- 测试：Host 自检新增 PDF 段（解析、公式标记、字体、覆盖写入译文、对照页数、路由 pdfExtract/pdfBuild）；
+  客户端自检新增 PdfPane 渲染冒烟
+
 ## 1.4.0 — 可分享 / 可安装
 
 - 包元数据补全：`repository` / `homepage` / `bugs` / `keywords` / `engines.dsh` / `scripts`，

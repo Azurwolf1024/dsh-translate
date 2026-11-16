@@ -347,6 +347,32 @@ window.__ModuleLoader__.load({
 
 		/* ═══════════════════════ 外部划译（系统级伴生进程） ═══════════════════════ */
 
+		function assetUrl(path) {
+			try {
+				return new URL('/dsh-translate/assets/' + path, window.location.origin).toString();
+			} catch (error) {
+				return '/dsh-translate/assets/' + path;
+			}
+		}
+
+		var pdfjsPromise = null;
+		/** 浏览器里按需加载 pdf.js（Host 的静态路由提供，走 npm 依赖里的产物）。 */
+		function loadPdfjs() {
+			if (pdfjsPromise) return pdfjsPromise;
+			pdfjsPromise = import(assetUrl('pdfjs/pdf.min.mjs'))
+				.then(function (mod) {
+					try {
+						mod.GlobalWorkerOptions.workerSrc = assetUrl('pdfjs/pdf.worker.min.mjs');
+					} catch (error) { /* ignore */ }
+					return mod;
+				})
+				.catch(function (error) {
+					pdfjsPromise = null;
+					throw new Error('pdf.js 加载失败：' + (error.message || error));
+				});
+			return pdfjsPromise;
+		}
+
 		function isWindowsHost() {
 			try {
 				return /Windows/i.test(String(window.navigator.userAgent || ''));
@@ -1546,6 +1572,332 @@ window.__ModuleLoader__.load({
 
 		/* ── 文件页 ── */
 
+		/** PDF 翻译面板：提取 → （扫描页 OCR）→ 逐块翻译 → 生成双语/单语 PDF。 */
+		function PdfPane(props) {
+			var s = useStore();
+			var file = props.file;
+			var phasePair = useState('extracting');
+			var phase = phasePair[0];
+			var setPhase = phasePair[1];
+			var pagesPair = useState([]);
+			var pages = pagesPair[0];
+			var setPages = pagesPair[1];
+			var infoPair = useState(null);
+			var info = infoPair[0];
+			var setInfo = infoPair[1];
+			var progressPair = useState({ done: 0, total: 0 });
+			var progress = progressPair[0];
+			var setProgress = progressPair[1];
+			var errorPair = useState(null);
+			var error = errorPair[0];
+			var setError = errorPair[1];
+			var resultPair = useState(null);
+			var result = resultPair[0];
+			var setResult = resultPair[1];
+			var modePair = useState('overlay');
+			var mode = modePair[0];
+			var setMode = modePair[1];
+			var ocrPair = useState(true);
+			var ocr = ocrPair[0];
+			var setOcr = ocrPair[1];
+			var samplePair = useState(false);
+			var sample = samplePair[0];
+			var setSample = samplePair[1];
+			var controller = useRef(null);
+			var translationsRef = useRef({});
+			var downloadRef = useRef(null);
+
+			useEffect(function () {
+				extract();
+				return function () {
+					if (controller.current) controller.current.abort();
+				};
+			}, []);
+
+			function base64Of(buffer) {
+				return toBase64(buffer);
+			}
+
+			async function extract() {
+				setPhase('extracting');
+				setError(null);
+				try {
+					var buffer = await props.bytes();
+					var data = await api('pdfExtract', { name: file.name, dataBase64: base64Of(buffer) });
+					setPages(data.pages);
+					setInfo({ pageCount: data.pageCount, read: data.pages.length, name: data.name });
+					var total = data.pages.reduce(function (sum, page) {
+						return sum + page.blocks.filter(function (block) { return block.translatable; }).length;
+					}, 0);
+					setProgress({ done: 0, total: total });
+					setPhase('ready');
+				} catch (failure) {
+					setError(failure.message || String(failure));
+					setPhase('error');
+				}
+			}
+
+			function renderPageToBase64(pdfjs, doc, index) {
+				return doc.getPage(index + 1).then(function (page) {
+					var viewport = page.getViewport({ scale: 2 });
+					var canvas = document.createElement('canvas');
+					canvas.width = Math.ceil(viewport.width);
+					canvas.height = Math.ceil(viewport.height);
+					return page
+						.render({ canvasContext: canvas.getContext('2d'), viewport: viewport, canvas: canvas })
+						.promise.then(function () {
+							var url = canvas.toDataURL('image/png');
+							return url.slice(url.indexOf(',') + 1);
+						});
+				});
+			}
+
+			async function run() {
+				if (phase === 'translating' || phase === 'building') return;
+				var control = new AbortController();
+				controller.current = control;
+				translationsRef.current = {};
+				setError(null);
+				setResult(null);
+				try {
+					var buffer = await props.bytes();
+					var workingPages = pages;
+					var scanned = workingPages.filter(function (page) { return page.textChars < 30; });
+					if (scanned.length > 0 && ocr) {
+						setPhase('ocr');
+						var pdfjs = await loadPdfjs();
+						var doc = await pdfjs.getDocument({ data: new Uint8Array(buffer.slice(0)) }).promise;
+						try {
+							for (var i = 0; i < scanned.length; i += 1) {
+								if (control.signal.aborted) throw new Error('已取消');
+								var page = scanned[i];
+								setProgress({ done: 0, total: scanned.length, note: 'OCR 第 ' + (i + 1) + '/' + scanned.length + ' 页' });
+								var png = await renderPageToBase64(pdfjs, doc, page.index);
+								var ocrResult = await api(
+									'pdfOcrPage',
+									{ pngBase64: png, pageWidth: page.width, pageHeight: page.height, scale: 2 },
+									control.signal
+								);
+								page.blocks = ocrResult.blocks || [];
+								page.textChars = page.blocks.reduce(function (sum, block) { return sum + block.text.length; }, 0);
+								page.ocr = true;
+							}
+						} finally {
+							await doc.destroy().catch(function () {});
+						}
+						setPages(workingPages.slice());
+					} else if (scanned.length > 0 && !ocr) {
+						setError('这份 PDF 有 ' + scanned.length + ' 页没有文本层（扫描件）。勾选「扫描页 OCR」再试。');
+						setPhase('ready');
+						return;
+					}
+
+					setPhase('translating');
+					var todo = [];
+					for (var p = 0; p < workingPages.length; p += 1) {
+						for (var b = 0; b < workingPages[p].blocks.length; b += 1) {
+							var block = workingPages[p].blocks[b];
+							if (block.translatable) todo.push({ page: workingPages[p].index, block: block });
+						}
+					}
+					setProgress({ done: 0, total: todo.length });
+					for (var t = 0; t < todo.length; t += 1) {
+						if (control.signal.aborted) throw new Error('已取消');
+						var item = todo[t];
+						var response = await api(
+							'translate',
+							{
+								text: item.block.text,
+								targetLanguage: store.settings.targetLanguage,
+								tone: store.settings.tone,
+								glossary: store.settings.glossary,
+								model: store.settings.model || undefined,
+								keepAlive: store.settings.keepAlive
+							},
+							control.signal
+						);
+						translationsRef.current[item.page + ':' + item.block.id] = response.text;
+						if ((t + 1) % 3 === 0 || t + 1 === todo.length) setProgress({ done: t + 1, total: todo.length });
+					}
+
+					setPhase('building');
+					var geometry = workingPages.map(function (page) {
+						return {
+							index: page.index,
+							width: page.width,
+							height: page.height,
+							blocks: page.blocks.map(function (block) {
+								return {
+									id: block.id,
+									x: block.x,
+									y: block.y,
+									width: block.width,
+									height: block.height,
+									fontSize: block.fontSize,
+									translatable: block.translatable
+								};
+							})
+						};
+					});
+					var built = await api(
+						'pdfBuild',
+						{
+							dataBase64: base64Of(buffer),
+							pages: geometry,
+							translations: translationsRef.current,
+							mode: mode,
+							sampleBackground: sample
+						},
+						control.signal
+					);
+					var output = built.dataBase64;
+					setResult({ bytes: built.bytes, mode: built.mode });
+					setPhase('done');
+					download(baseName(file.name) + (mode === 'dual' ? '.双语对照.pdf' : '.译文.pdf'), output);
+					refreshStatus();
+				} catch (failure) {
+					if (failure && (failure.name === 'AbortError' || /已取消/.test(String(failure.message)))) {
+						setPhase('ready');
+						return;
+					}
+					setError(failure.message || String(failure));
+					setPhase('ready');
+				} finally {
+					if (controller.current === control) controller.current = null;
+				}
+			}
+
+			function baseName(name) {
+				return String(name || 'document.pdf').replace(/\.pdf$/i, '');
+			}
+
+			function download(name, base64) {
+				var anchor = downloadRef.current;
+				if (!anchor) return;
+				var binary = window.atob(base64);
+				var bytes = new Uint8Array(binary.length);
+				for (var i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+				var url = window.URL.createObjectURL(new window.Blob([bytes], { type: 'application/pdf' }));
+				anchor.href = url;
+				anchor.download = name;
+				anchor.click();
+				window.setTimeout(function () { window.URL.revokeObjectURL(url); }, 4000);
+			}
+
+			var busy = phase === 'translating' || phase === 'building' || phase === 'ocr';
+			var percent = progress.total ? Math.round((progress.done / progress.total) * 100) : 0;
+
+			return h(
+				'div',
+				null,
+				h('a', { ref: downloadRef, style: { display: 'none' }, 'aria-hidden': 'true' }, ''),
+				h(
+					'div',
+					{ className: 'dstr-row', style: { marginTop: '6px' } },
+					h('span', { className: 'dstr-chip' }, 'PDF'),
+					h('span', null, file.name),
+					info ? h('span', { className: 'dstr-hint' }, info.pageCount + ' 页 · 已解析 ' + info.read + ' 页') : null,
+					h('span', { className: 'dstr-spacer' }),
+					h(
+						'button',
+						{ type: 'button', className: 'dstr-btn ghost', onClick: props.onClose, disabled: busy },
+						'换一个文件'
+					)
+				),
+				h(
+					'div',
+					{ className: 'dstr-row', style: { marginTop: '10px' } },
+					h(
+						'label',
+						{ className: 'dstr-field' },
+						h('span', { className: 'dstr-label' }, '输出方式'),
+						h(
+							'select',
+							{
+								className: 'dstr-select',
+								value: mode,
+								onChange: function (event) { setMode(event.target.value); }
+							},
+							h('option', { value: 'overlay' }, '覆盖原文（默认）'),
+							h('option', { value: 'dual' }, '原文 + 译文对照')
+						)
+					),
+					h(
+						'label',
+						{ className: 'dstr-switch', style: { minWidth: '210px' } },
+						h('span', { className: 'dstr-hint' }, '扫描页 OCR（无文本层时）'),
+						h(
+							'button',
+							{
+								type: 'button',
+								className: 'dstr-switch-btn',
+								role: 'switch',
+								'aria-checked': ocr ? 'true' : 'false',
+								onClick: function () { setOcr(!ocr); }
+							},
+							h('i', null)
+						)
+					),
+					h(
+						'label',
+						{ className: 'dstr-switch', style: { minWidth: '190px' } },
+						h('span', { className: 'dstr-hint' }, '覆盖时采样原页底色'),
+						h(
+							'button',
+							{
+								type: 'button',
+								className: 'dstr-switch-btn',
+								role: 'switch',
+								'aria-checked': sample ? 'true' : 'false',
+								onClick: function () { setSample(!sample); }
+							},
+							h('i', null)
+						)
+					)
+				),
+				error ? h('div', { className: 'dstr-error', style: { marginTop: '12px' } }, error) : null,
+				h(
+					'div',
+					{ className: 'dstr-file-bar' },
+					h(
+						'button',
+						{ type: 'button', className: 'dstr-btn primary', onClick: run, disabled: busy || phase === 'extracting' },
+						phase === 'extracting'
+							? '解析中…'
+							: phase === 'ocr'
+								? 'OCR 中…'
+								: phase === 'translating'
+									? '翻译中…'
+									: phase === 'building'
+										? '生成 PDF…'
+										: '开始翻译'
+					),
+					busy
+						? h(
+								'button',
+								{
+									type: 'button',
+									className: 'dstr-btn',
+									onClick: function () {
+										if (controller.current) controller.current.abort();
+									}
+								},
+								'取消'
+							)
+						: null,
+					h('div', { className: 'dstr-progress' }, h('i', { style: { width: (busy ? percent : phase === 'done' ? 100 : 0) + '%' } })),
+					h('span', { className: 'dstr-hint' }, progress.note || (progress.total ? progress.done + ' / ' + progress.total + ' 块' : '')),
+					result ? h('span', { className: 'dstr-hint' }, '已生成 ' + (result.bytes / 1024 / 1024).toFixed(1) + ' MB') : null
+				),
+				h(
+					'div',
+					{ className: 'dstr-hint', style: { marginTop: '10px' } },
+					'覆盖模式：在原页面上把选中段落替换成译文（公式/代码默认保留原文）；对照模式：每页原文后插一页译文。' +
+						'OCR 需要 Windows 自带的识别引擎，扫描页会先识别再翻译。'
+				)
+			);
+		}
+
 		function FileTab() {
 			var s = useStore();
 			var infoPair = useState(null);
@@ -1570,6 +1922,10 @@ window.__ModuleLoader__.load({
 			var segmentsRef = useRef([]);
 			var downloadRef = useRef(null);
 			var fileInput = useRef(null);
+			var pdfPair = useState(null);
+			var pdfFile = pdfPair[0];
+			var setPdfFile = pdfPair[1];
+			var pdfBytesRef = useRef(null);
 
 			segmentsRef.current = segments;
 
@@ -1581,6 +1937,16 @@ window.__ModuleLoader__.load({
 
 			async function accept(file) {
 				if (!file) return;
+				if (/\.pdf$/i.test(file.name)) {
+					if (running) {
+						setError('请先取消正在进行的翻译');
+						return;
+					}
+					pdfBytesRef.current = await file.arrayBuffer();
+					setError(null);
+					setPdfFile({ name: file.name });
+					return;
+				}
 				if (running) {
 					setError('请先取消正在进行的翻译');
 					return;
@@ -1748,6 +2114,19 @@ window.__ModuleLoader__.load({
 			}
 			var visible = indexed.length > MAX_RENDERED_SEGMENTS ? indexed.slice(0, MAX_RENDERED_SEGMENTS) : indexed;
 
+			if (pdfFile) {
+				return h(PdfPane, {
+					file: pdfFile,
+					bytes: function () {
+						return Promise.resolve(pdfBytesRef.current);
+					},
+					onClose: function () {
+						setPdfFile(null);
+						pdfBytesRef.current = null;
+					}
+				});
+			}
+
 			return h(
 				'div',
 				null,
@@ -1756,7 +2135,7 @@ window.__ModuleLoader__.load({
 					ref: fileInput,
 					type: 'file',
 					style: { display: 'none' },
-					accept: '.txt,.text,.log,.md,.markdown,.mdx,.rst,.adoc,.tex,.csv,.tsv,.json,.jsonl,.yaml,.yml,.ini,.toml,.env,.srt,.vtt,.html,.htm,.xhtml,.xml,.docx,.docm,.xlsx,.xlsm,.pptx,.pptm,.epub',
+					accept: '.txt,.text,.log,.md,.markdown,.mdx,.rst,.adoc,.tex,.csv,.tsv,.json,.jsonl,.yaml,.yml,.ini,.toml,.env,.srt,.vtt,.html,.htm,.xhtml,.xml,.docx,.docm,.xlsx,.xlsm,.pptx,.pptm,.epub,.pdf',
 					onChange: function (event) {
 						var file = event.target.files && event.target.files[0];
 						accept(file);
@@ -1788,7 +2167,7 @@ window.__ModuleLoader__.load({
 					h(
 						'div',
 						{ className: 'dstr-drop-hint' },
-						'文档：.docx / .xlsx / .pptx / .epub · 文本：.txt / .md / .srt / .html / .json / .csv …',
+						'文档：.pdf / .docx / .xlsx / .pptx / .epub · 文本：.txt / .md / .srt / .html / .json / .csv …',
 						h('br', null),
 						'单个文件上限 12 MB；PDF 与旧版 Office 二进制格式暂不支持'
 					)
@@ -2192,6 +2571,7 @@ window.__ModuleLoader__.load({
 				Workbench: Workbench,
 				TextTab: TextTab,
 				FileTab: FileTab,
+				PdfPane: PdfPane,
 				SetupNotice: SetupNotice,
 				SettingsTab: SettingsTab,
 				SelectionPopover: SelectionPopover,

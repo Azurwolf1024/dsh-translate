@@ -32,11 +32,12 @@ param(
     [switch]$TestOverlay,
     [switch]$NoUi,
     [switch]$NoOcr,
-    [switch]$TestOcr
+    [switch]$TestOcr,
+    [string]$OcrImage = ''
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '1.4.0'
+$script:ScriptVersion = '1.5.0'
 $script:ThemePath = $ThemePath
 
 # ───────────────────────────── 日志 ─────────────────────────────
@@ -1094,6 +1095,78 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
     $appLabel = (Get-ProcessNameOfWindow $hwnd)
     Write-Log ("gesture app=$appLabel source=$source chars=" + $text.Length)
     Start-Translate $text $point.X $point.Y
+}
+
+# ───────────────────────────── OCR 单图：给图片，返回带坐标的行 ─────────────────────────────
+
+if ($OcrImage) {
+    $result = @{ ok = $false; lines = @(); error = ''; engine = $null }
+    $bitmap = $null
+    try {
+        $engines = Initialize-Ocr
+        if (-not $engines) { throw 'OCR engine unavailable (no language pack)' }
+        if (-not (Test-Path $OcrImage)) { throw ('image not found: ' + $OcrImage) }
+        $bitmap = [System.Drawing.Bitmap]::FromFile($OcrImage)
+        $scale = 1
+        $source = $bitmap
+        $big = $null
+        if ($bitmap.Height -lt [int](40 * $script:Scale)) {
+            $big = New-Object System.Drawing.Bitmap -ArgumentList ($bitmap.Width * 2), ($bitmap.Height * 2)
+            $g = [System.Drawing.Graphics]::FromImage($big)
+            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g.DrawImage($bitmap, 0, 0, $big.Width, $big.Height)
+            $g.Dispose()
+            $source = $big
+            $scale = 2
+        }
+        $stream = New-Object System.IO.MemoryStream
+        $source.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+        $stream.Position = 0
+        $ras = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($stream)
+        $decoder = Await-WinRt ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($ras)) ([Windows.Graphics.Imaging.BitmapDecoder])
+        $software = Await-WinRt ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+        $lines = @()
+        $usedEngine = $null
+        foreach ($engine in $engines) {
+            $ocr = Await-WinRt ($engine.RecognizeAsync($software)) ([Windows.Media.Ocr.OcrResult])
+            if (-not $ocr -or $ocr.Lines.Count -eq 0) { continue }
+            $lines = @()
+            foreach ($line in $ocr.Lines) {
+                $value = $line.Text
+                if (-not $value -or -not $value.Trim()) { continue }
+                $value = [regex]::Replace($value, '(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])', '')
+                $left = [double]::MaxValue; $top = [double]::MaxValue; $right = 0.0; $bottom = 0.0
+                foreach ($word in $line.Words) {
+                    $r = $word.BoundingRect
+                    if ($r.X -lt $left) { $left = $r.X }
+                    if ($r.Y -lt $top) { $top = $r.Y }
+                    if (($r.X + $r.Width) -gt $right) { $right = $r.X + $r.Width }
+                    if (($r.Y + $r.Height) -gt $bottom) { $bottom = $r.Y + $r.Height }
+                }
+                if ($right -le $left -or $bottom -le $top) { continue }
+                $lines += @{
+                    text = $value.Trim()
+                    x    = [int][Math]::Round($left / $scale)
+                    y    = [int][Math]::Round($top / $scale)
+                    w    = [int][Math]::Round(($right - $left) / $scale)
+                    h    = [int][Math]::Round(($bottom - $top) / $scale)
+                }
+            }
+            $usedEngine = $engine
+            if ($lines.Count -gt 0) { break }
+        }
+        $result.lines = $lines
+        $result.engine = $(if ($usedEngine) { $usedEngine.RecognizerLanguage.LanguageTag } else { $null })
+        $result.ok = $true
+        $stream.Dispose()
+        if ($big) { $big.Dispose() }
+    } catch {
+        $result.error = $_.Exception.Message
+    } finally {
+        if ($bitmap) { $bitmap.Dispose() }
+    }
+    $result | ConvertTo-Json -Depth 5
+    if ($result.ok) { exit 0 } else { exit 1 }
 }
 
 # ───────────────────────────── OCR 自检（画一张位图再识别） ─────────────────────────────

@@ -215,6 +215,20 @@ check(
 self.store.status = { ...self.store.status, installed: true }
 check('一切就绪时不渲染提示', components.SetupNotice() === null)
 
+// PDF 面板：初始（解析中）状态能渲染，且能看到「覆盖/对照」「OCR」这些关键控件
+const pdfPane = render('PdfPane（解析中）', () =>
+  components.PdfPane({ file: { name: 'paper.pdf' }, bytes: async () => new ArrayBuffer(8), onClose() {} })
+)
+check('PDF 面板渲染了输出方式选择', !!findNode(pdfPane, (node) => node.type === 'select'))
+check(
+  'PDF 面板有覆盖/对照两个选项',
+  !!findNode(pdfPane, (node) => String(node.children[0] || '').includes('覆盖原文'))
+)
+check(
+  'PDF 面板有扫描页 OCR 开关',
+  !!findNode(pdfPane, (node) => node.props && node.props['aria-label'] === undefined && String(node.props.className || '').includes('dstr-switch'))
+)
+
 function findNode(root, predicate) {
   if (!root || typeof root !== 'object') return null
   if (predicate(root)) return root

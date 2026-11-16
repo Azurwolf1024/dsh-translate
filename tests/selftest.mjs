@@ -169,8 +169,14 @@ async function callRoute(route, options = {}) {
 const { ctx, routes, effects } = makeFakeCtx()
 apply(ctx, { model: 'kaelri/hy-mt2:1.8b', keepAlive: '5m', idleUnloadMs: 60000 })
 
-check('注册了唯一路由', routes.length === 1 && routes[0].path === ROUTE_PATH && routes[0].kind === 'exact')
-const route = routes[0]
+check(
+  '注册了 API 精确路由 + 资源前缀路由',
+  routes.length === 2 &&
+    routes.some((item) => item.kind === 'exact' && item.path === ROUTE_PATH) &&
+    routes.some((item) => item.kind === 'prefix' && item.path === '/dsh-translate/assets'),
+  JSON.stringify(routes.map((item) => item.kind + ' ' + item.path))
+)
+const route = routes.find((item) => item.path === ROUTE_PATH)
 
 const foreign = await callRoute(route, { headers: { origin: 'http://evil.example', host: '127.0.0.1:61213' } })
 check('拒绝跨源请求', foreign.status === 403, JSON.stringify(foreign.json))
@@ -226,6 +232,84 @@ if (live) {
   const unloaded = await callRoute(route, { body: JSON.stringify({ action: 'unload' }) })
   check('卸载后 loaded=false', unloaded.json?.ok === true && unloaded.json.status.loaded === false, JSON.stringify(unloaded.json?.status))
 }
+
+section('4. PDF 排版（pdf.js + pdf-lib）')
+
+const { PDFDocument, StandardFonts, rgb } = await import('pdf-lib')
+const pdfModule = await import('../pdf.js')
+
+async function makeFixturePdf() {
+  const doc = await PDFDocument.create()
+  const page = doc.addPage([595, 842])
+  const font = await doc.embedFont(StandardFonts.Helvetica)
+  page.drawText('The inner product of two vectors is a single real number.', { x: 72, y: 760, size: 12, font, color: rgb(0, 0, 0) })
+  page.drawText('It is also called the dot product.', { x: 72, y: 740, size: 12, font, color: rgb(0, 0, 0) })
+  page.drawText('u = [ 1  2 ]  v = [ 3  4 ]', { x: 72, y: 700, size: 12, font, color: rgb(0, 0, 0) })
+  return new Uint8Array(await doc.save())
+}
+
+const fixturePdf = await makeFixturePdf()
+const parsed = await pdfModule.readPdfBlocks(fixturePdf)
+check('pdf 解析出页与段落', parsed.pageCount === 1 && parsed.pages[0].blocks.length >= 2, JSON.stringify(parsed.pages?.map((page) => page.blocks.length)))
+check(
+  'pdf 段落文本正确',
+  parsed.pages[0].blocks.some((block) => block.text.includes('inner product')),
+  parsed.pages[0].blocks.map((block) => block.text.slice(0, 40)).join(' | ')
+)
+check('公式行被标记为不翻译', parsed.pages[0].blocks.some((block) => !block.translatable))
+
+const fontInfo = pdfModule.resolvePdfFont()
+check('找到可嵌入的中文字体', fontInfo && !/\.ttc$/i.test(fontInfo.path), fontInfo && fontInfo.path)
+if (fontInfo) {
+  const translations = {}
+  for (const block of parsed.pages[0].blocks) {
+    if (block.translatable) translations[`0:${block.id}`] = '内积是两个向量的一个实数。'
+  }
+  const overlayPdf = await pdfModule.buildBilingualPdf({
+    bytes: fixturePdf,
+    pages: parsed.pages,
+    translations,
+    mode: 'overlay',
+    font: fontInfo,
+    options: {},
+  })
+  check('覆盖模式生成了 PDF', overlayPdf.length > fixturePdf.length, `${overlayPdf.length} bytes`)
+  const checkDoc = await import('pdfjs-dist/legacy/build/pdf.mjs')
+  const checkLoaded = await checkDoc.getDocument({ data: new Uint8Array(overlayPdf), standardFontDataUrl: '' }).promise
+  const outPage = await checkLoaded.getPage(1)
+  const outContent = await outPage.getTextContent()
+  const outText = outContent.items.map((item) => item.str).join('')
+  await checkLoaded.destroy()
+  check('覆盖模式里写入了译文', outText.includes('内积'), outText.slice(0, 80))
+
+  const dualPdf = await pdfModule.buildBilingualPdf({
+    bytes: fixturePdf,
+    pages: parsed.pages,
+    translations,
+    mode: 'dual',
+    font: fontInfo,
+    options: {},
+  })
+  const dualDoc = await checkDoc.getDocument({ data: new Uint8Array(dualPdf), standardFontDataUrl: '' }).promise
+  check('对照模式是原文页 + 译文页', dualDoc.numPages === 2, String(dualDoc.numPages))
+  await dualDoc.destroy()
+}
+
+const routePdf = await callRoute(route, {
+  body: JSON.stringify({ action: 'pdfExtract', name: 'fixture.pdf', dataBase64: Buffer.from(fixturePdf).toString('base64') }),
+})
+check('路由 pdfExtract 返回页面与段落', routePdf.json?.ok === true && routePdf.json.pages.length === 1, JSON.stringify(routePdf.json?.error))
+
+const routeBuild = await callRoute(route, {
+  body: JSON.stringify({
+    action: 'pdfBuild',
+    dataBase64: Buffer.from(fixturePdf).toString('base64'),
+    pages: routePdf.json?.pages || [],
+    translations: { '0:b0': '内积测试' },
+    mode: 'overlay',
+  }),
+})
+check('路由 pdfBuild 返回 PDF base64', routeBuild.json?.ok === true && String(routeBuild.json.dataBase64 || '').length > 100, JSON.stringify(routeBuild.json?.error))
 
 check('effect 清理函数已登记', effects.length >= 2)
 for (const disposer of effects) if (typeof disposer === 'function') disposer()

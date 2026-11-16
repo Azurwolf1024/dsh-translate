@@ -24,12 +24,15 @@
 
 import { inflateRawSync } from 'node:zlib'
 import { spawn } from 'node:child_process'
-import { existsSync, writeFileSync } from 'node:fs'
+import { existsSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const ROUTE_PATH = '/dsh-translate/api'
+/** pdf.js 浏览器产物（文字层 + worker）的静态资源前缀，客户端动态 import 它。 */
+export const ASSET_PREFIX = '/dsh-translate/assets'
 
 /* ────────────────────────────── 语言 / 语气表 ────────────────────────────── */
 
@@ -559,7 +562,21 @@ export function extractText({ name, bytes }) {
 /* ─────────────────────────────── 配置归一 ─────────────────────────────── */
 
 /** 外部划译伴生进程（Windows PowerShell 5.1，零外部依赖）。 */
-export const HELPER_FILE = join(dirname(fileURLToPath(import.meta.url)), 'helper', 'dsh-translate-capture.ps1')
+export const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url))
+
+let pdfModulePromise = null
+/** 按文件 mtime 做 cache-bust，避免改了 pdf.js 还被 ESM 缓存挡住。 */
+function loadPdfModule() {
+  if (pdfModulePromise) return pdfModulePromise
+  let rev = '0'
+  try { rev = String(Math.round(statSync(join(PACKAGE_ROOT, 'pdf.js')).mtimeMs)) } catch { /* 用 0 兜底 */ }
+  pdfModulePromise = import(`./pdf.js?rev=${rev}`).catch((error) => {
+    pdfModulePromise = null
+    throw error
+  })
+  return pdfModulePromise
+}
+export const HELPER_FILE = join(PACKAGE_ROOT, 'helper', 'dsh-translate-capture.ps1')
 export const HELPER_LOG = join(tmpdir(), 'dsh-translate-capture.log')
 /** 客户端把 DSH 的主题 token 写在这里，伴生进程照着画浮窗（跟随亮/暗主题与字体）。 */
 export const HELPER_THEME = join(tmpdir(), 'dsh-translate-theme.json')
@@ -595,6 +612,10 @@ export const DEFAULTS = Object.freeze({
   maxTextChars: 20000,
   chunkChars: 1200,
   maxUploadBytes: 12 * 1024 * 1024,
+  /** PDF 原文件上限（base64 之前的字节数）。 */
+  maxPdfBytes: 60 * 1024 * 1024,
+  /** 生成双语 PDF 用的中文字体路径（留空 = 自动找系统字体）。 */
+  pdfFont: '',
   defaultTarget: 'auto',
   tone: 'natural',
 })
@@ -620,6 +641,8 @@ export function normalizeConfig(raw) {
     maxTextChars: numberOr(input.maxTextChars, DEFAULTS.maxTextChars, 500, 500000),
     chunkChars: numberOr(input.chunkChars, DEFAULTS.chunkChars, 120, 8000),
     maxUploadBytes: numberOr(input.maxUploadBytes, DEFAULTS.maxUploadBytes, 1024, 64 * 1024 * 1024),
+    maxPdfBytes: numberOr(input.maxPdfBytes, DEFAULTS.maxPdfBytes, 1024 * 1024, 256 * 1024 * 1024),
+    pdfFont: typeof input.pdfFont === 'string' ? input.pdfFont : DEFAULTS.pdfFont,
     defaultTarget: LANGS[target] || target === 'auto' ? target : DEFAULTS.defaultTarget,
     tone: TONES[String(input.tone || '')] ? String(input.tone) : DEFAULTS.tone,
     temperature: numberOr(input.temperature, 0.2, 0, 1.5),
@@ -994,6 +1017,59 @@ async function translateSegments({ state, cfg, segments, spec, signal }) {
 
 /* ─────────────────────────────── HTTP 路由 ─────────────────────────────── */
 
+/** 只放行 pdfjs-dist 里的白名单文件，路径不允许 .. 逃逸。 */
+const ASSET_FILES = {
+  'pdfjs/pdf.min.mjs': ['node_modules/pdfjs-dist/build/pdf.min.mjs', 'text/javascript; charset=utf-8'],
+  'pdfjs/pdf.worker.min.mjs': ['node_modules/pdfjs-dist/build/pdf.worker.min.mjs', 'text/javascript; charset=utf-8'],
+  'pdfjs/pdf.min.mjs.map': ['node_modules/pdfjs-dist/build/pdf.min.mjs.map', 'application/json'],
+  'pdfjs/pdf.worker.min.mjs.map': ['node_modules/pdfjs-dist/build/pdf.worker.min.mjs.map', 'application/json'],
+}
+
+async function serveAsset(req, res) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    sendJson(res, 405, { ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: '只支持 GET' } })
+    return
+  }
+  const pathname = new URL(req.url || '/', 'http://x').pathname
+  const relative = decodeURIComponent(pathname.slice(ASSET_PREFIX.length)).replace(/^\/+/, '')
+  const direct = ASSET_FILES[relative]
+  if (direct) {
+    let body
+    try {
+      body = await readFile(join(PACKAGE_ROOT, direct[0]))
+    } catch (error) {
+      sendJson(res, 404, { ok: false, error: { code: 'NOT_FOUND', message: '没有这个资源' } })
+      return
+    }
+    res.writeHead(200, {
+      'content-type': direct[1],
+      'content-length': String(body.length),
+      'cache-control': 'public, max-age=86400',
+    })
+    res.end(req.method === 'HEAD' ? undefined : body)
+    return
+  }
+  // standard_fonts / cmaps 供 pdf.js 渲染时按需取用
+  if (/^(standard_fonts|cmaps)\/[A-Za-z0-9._-]+$/.test(relative)) {
+    let body
+    try {
+      body = await readFile(join(PACKAGE_ROOT, 'node_modules/pdfjs-dist', relative))
+    } catch (error) {
+      sendJson(res, 404, { ok: false, error: { code: 'NOT_FOUND', message: '没有这个资源' } })
+      return
+    }
+    const type = relative.endsWith('.bcmap') ? 'application/octet-stream' : 'application/octet-stream'
+    res.writeHead(200, {
+      'content-type': type,
+      'content-length': String(body.length),
+      'cache-control': 'public, max-age=86400',
+    })
+    res.end(req.method === 'HEAD' ? undefined : body)
+    return
+  }
+  sendJson(res, 404, { ok: false, error: { code: 'NOT_FOUND', message: '没有这个资源' } })
+}
+
 function sendJson(res, status, payload) {
   if (res.writableEnded) return
   const body = Buffer.from(JSON.stringify(payload), 'utf8')
@@ -1057,6 +1133,63 @@ function readBody(req, limit) {
   })
 }
 
+function decodeBase64(value, label) {
+  const text = String(value || '')
+  if (!text) throw new TranslateError('BAD_REQUEST', `缺少${label}数据`)
+  try {
+    return Buffer.from(text, 'base64')
+  } catch (error) {
+    throw new TranslateError('BAD_REQUEST', `${label} base64 解码失败`)
+  }
+}
+
+/** 跑一次伴生进程（-OcrImage 这类一次性模式），收它的 stdout。 */
+function runHelper(extraArgs, timeoutMs) {
+  if (process.platform !== 'win32') {
+    return Promise.reject(new TranslateError('UNSUPPORTED', 'OCR 依赖 Windows 自带的识别引擎'))
+  }
+  const powershell =
+    process.platform === 'win32'
+      ? join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+      : 'powershell.exe'
+  const exe = existsSync(powershell) ? powershell : 'powershell.exe'
+  const args = ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', HELPER_FILE, '-LogPath', HELPER_LOG, ...extraArgs]
+  return new Promise((resolve, reject) => {
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    let child = null
+    const finish = (error, value) => {
+      if (settled) return
+      settled = true
+      if (error) reject(error)
+      else resolve(value)
+    }
+    try {
+      child = spawn(exe, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (error) {
+      finish(new TranslateError('HELPER_SPAWN_FAILED', `无法启动伴生进程：${error?.message || error}`))
+      return
+    }
+    const timer = setTimeout(() => {
+      try { child.kill() } catch (error) { /* 已退出 */ }
+      finish(new TranslateError('OCR_TIMEOUT', 'OCR 超时'))
+    }, Math.max(5000, timeoutMs || 60000))
+    if (typeof timer.unref === 'function') timer.unref()
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8') })
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8') })
+    child.on('error', (error) => {
+      clearTimeout(timer)
+      finish(new TranslateError('HELPER_SPAWN_FAILED', `伴生进程启动失败：${error?.message || error}`))
+    })
+    child.on('exit', (code) => {
+      clearTimeout(timer)
+      if (code === 0) finish(null, stdout)
+      else finish(new TranslateError('OCR_FAILED', `OCR 进程退出（code ${code}）：${stderr.slice(-200) || stdout.slice(-200)}`))
+    })
+  })
+}
+
 function jsonBody(buffer) {
   if (!buffer || buffer.length === 0) return {}
   let parsed
@@ -1116,6 +1249,87 @@ async function handleAction(state, body, signal) {
   if (action === 'externalStatus') {
     state.diag.externalStatus += 1
     return { ok: true, external: externalSnapshot(state) }
+  }
+
+  if (action === 'pdfExtract') {
+    const mod = await loadPdfModule()
+    const bytes = decodeBase64(body.dataBase64, 'PDF')
+    if (bytes.length > state.cfg.maxPdfBytes) {
+      throw new TranslateError('PDF_TOO_LARGE', `PDF 超过上限 ${Math.round(state.cfg.maxPdfBytes / 1024 / 1024)} MB`)
+    }
+    const maxPages = Number.isInteger(body.maxPages) ? body.maxPages : undefined
+    const from = Number.isInteger(body.from) && body.from > 0 ? body.from : 1
+    const to = Number.isInteger(body.to) && body.to > 0 ? body.to : undefined
+    const result = await mod.readPdfBlocks(bytes, { maxPages, from, to })
+    return { ok: true, pageCount: result.pageCount, pages: result.pages, name: String(body.name || 'document.pdf') }
+  }
+
+  if (action === 'pdfBuild') {
+    const mod = await loadPdfModule()
+    const bytes = decodeBase64(body.dataBase64, 'PDF')
+    if (bytes.length > state.cfg.maxPdfBytes) {
+      throw new TranslateError('PDF_TOO_LARGE', `PDF 超过上限 ${Math.round(state.cfg.maxPdfBytes / 1024 / 1024)} MB`)
+    }
+    const font = mod.resolvePdfFont(state.cfg.pdfFont)
+    if (!font) {
+      throw new TranslateError(
+        'PDF_FONT_MISSING',
+        '找不到可嵌入的中文字体：请在配置里设置 pdfFont（指向一个 .ttf/.otf 单文件字体，TTC 集合不支持）',
+      )
+    }
+    const mode = body.mode === 'dual' ? 'dual' : 'overlay'
+    const output = await mod.buildBilingualPdf({
+      bytes,
+      pages: Array.isArray(body.pages) ? body.pages : [],
+      translations: body.translations && typeof body.translations === 'object' ? body.translations : {},
+      mode,
+      font,
+      options: {
+        sampleBackground: !!body.sampleBackground,
+        pageSamples: undefined,
+        minFontSize: Number(body.minFontSize) || undefined,
+      },
+    })
+    return {
+      ok: true,
+      mode,
+      bytes: output.length,
+      pageCount: Array.isArray(body.pages) ? body.pages.length : 0,
+      dataBase64: Buffer.from(output).toString('base64'),
+    }
+  }
+
+  if (action === 'pdfOcrPage') {
+    const mod = await loadPdfModule()
+    const png = decodeBase64(body.pngBase64, 'PNG')
+    if (png.length > 24 * 1024 * 1024) throw new TranslateError('BAD_REQUEST', '页面图片过大')
+    const scale = Number(body.scale) || 2
+    const file = join(tmpdir(), `dsh-translate-ocr-${process.pid}-${Date.now()}.png`)
+    writeFileSync(file, png)
+    try {
+      const output = await runHelper([`-OcrImage`, file], 90000)
+      let parsed = null
+      try {
+        const text = String(output || '')
+        const first = text.indexOf('{')
+        const last = text.lastIndexOf('}')
+        parsed = first >= 0 && last > first ? JSON.parse(text.slice(first, last + 1)) : null
+      } catch {
+        parsed = null
+      }
+      if (!parsed || parsed.ok !== true) {
+        throw new TranslateError('OCR_FAILED', (parsed && parsed.error) || 'OCR 失败')
+      }
+      const blocks = mod.blocksFromOcrLines(
+        parsed.lines || [],
+        Number(body.pageWidth) || 0,
+        Number(body.pageHeight) || 0,
+        scale,
+      )
+      return { ok: true, engine: parsed.engine || null, blocks }
+    } finally {
+      try { rmSync(file, { force: true }) } catch (error) { /* 临时文件清理失败无所谓 */ }
+    }
   }
 
   if (action === 'extract') {
@@ -1210,7 +1424,8 @@ async function handleRequest(state, req, res) {
   res.on('close', onClose)
 
   try {
-    const body = jsonBody(await readBody(req, state.cfg.maxUploadBytes * 2 + 1024 * 1024))
+    const bodyLimit = Math.max(state.cfg.maxUploadBytes * 2, state.cfg.maxPdfBytes * 2) + 1024 * 1024
+    const body = jsonBody(await readBody(req, bodyLimit))
     const payload = await handleAction(state, body, controller.signal)
     sendJson(res, 200, payload)
   } catch (error) {
@@ -1245,6 +1460,20 @@ export function apply(ctx, rawConfig) {
       return
     }
     if (typeof webServer.port === 'number' && webServer.port > 0) state.webPort = webServer.port
+    // pdf.js 浏览器产物（客户端 import 它来解析/渲染 PDF）
+    scope.effect(
+      () =>
+        webServer.register({
+          kind: 'prefix',
+          path: ASSET_PREFIX,
+          handler: (req, res) => serveAsset(req, res).catch((error) => {
+            state.log('warn', `asset 失败：${error?.message || error}`)
+            if (!res.writableEnded) sendJson(res, 500, { ok: false, error: { code: 'INTERNAL', message: '资源读取失败' } })
+          }),
+        }),
+      'dsh-translate: GET /dsh-translate/assets/*',
+    )
+
     scope.effect(
       () =>
         webServer.register({
