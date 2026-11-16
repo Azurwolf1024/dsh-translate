@@ -1,6 +1,6 @@
 {
   "name": "dsh-translate",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "Translate with a local Ollama model inside DeepSeek Harness: in-page selection popup, system-wide selection (UI Automation -> clipboard -> OCR fallback), text and file translation. Stateless requests, unloads the model when idle.",
   "type": "module",
   "main": "./index.js",
