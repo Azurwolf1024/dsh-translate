@@ -32,12 +32,13 @@ param(
     [switch]$TestOverlay,
     [switch]$NoUi,
     [switch]$NoOcr,
+    [switch]$AllowClipboard,
     [switch]$TestOcr,
     [string]$OcrImage = ''
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '1.5.0'
+$script:ScriptVersion = '1.5.1'
 $script:ThemePath = $ThemePath
 
 # ───────────────────────────── 日志 ─────────────────────────────
@@ -133,6 +134,7 @@ $script:BodyMaxScroll = 0
 $script:BodyLineHeight = 16
 $script:ScrollOffset = 0
 $script:LastSource = ''
+$script:PendingGesture = $null
 $script:OcrEngine = $null
 $script:OcrReady = 0
 $script:Anchor = $null
@@ -466,8 +468,14 @@ function Get-SelectionViaClipboard([IntPtr]$hwnd) {
     # 只有在「剪贴板根本没被写过」时才算失败；序号变了就说明应用真的复制了，
     # 哪怕内容和上一次一样（重复选同一段）也是有效结果。
     if (-not $text -and $beforeText) { $text = '' }
+    # 还原原则：只还原「我们自己写进去的那次」。如果期间用户自己按了 Ctrl+C（剪贴板序号又变了），
+    # 就别拿旧内容盖掉他刚复制的东西。
     if ($text -and $saved) {
-        try { [System.Windows.Forms.Clipboard]::SetDataObject($saved, $true) } catch { }
+        try {
+            if ([DTWin32]::GetClipboardSequenceNumber() -eq $before + 1) {
+                [System.Windows.Forms.Clipboard]::SetDataObject($saved, $true)
+            }
+        } catch { }
     }
     return $text
 }
@@ -1028,33 +1036,11 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
         }
     }
     if (-not $script:Anchor) { Set-AnchorFromRects $point $null }
-    # 关键：先 Trim 再判空白。PDF 选区文本常以 CRLF 结尾，末尾换行会被误判成词间空白，
-    # 从而永远跳过下面的兜底（之前就栽在这里：看起来取不到词，其实是不再补空格）。
+    # 先 Trim 再判断有没有词间空白（PDF 选区常以 CRLF 结尾）
     if ($text) { $text = $text.Trim() }
-    if (-not $text) {
-        $source = 'clipboard'
-        try { $text = Get-SelectionViaClipboard ($hwnd) } catch { $text = '' }
-        if ($text) { $text = $text.Trim() }
-        # 剪贴板这条路也一样：Edge 的 PDF 阅读器复制出来的文本也可能没有词间空格
-        if ($text -and $text -notmatch '\s' -and $text.Length -ge 8) {
-            $text = Restore-WordSpacing $text
-            $source = 'clipboard-respaced'
-        }
-    } elseif ($text -match '[A-Za-z]' -and $text -notmatch '[一-鿿]' -and $text -notmatch '\s' -and $text.Length -ge 8) {
-        # 纯拉丁文本却完全没有词间空白：多半是 PDF 文本层，剪贴板通常更准
-        $rescued = ''
-        try { $rescued = Get-SelectionViaClipboard ($hwnd) } catch { $rescued = '' }
-        if ($rescued) { $rescued = $rescued.Trim() }
-        if ($rescued -and $rescued -match '\s') {
-            $text = $rescued
-            $source = 'clipboard-rescue'
-        } else {
-            $text = Restore-WordSpacing $text
-            $source = 'uia-respaced'
-        }
-    }
-    # 到这里 UIA 和剪贴板都没拿到像样的文字（或拿到的没有词间空格）：用 OCR 兜底。
-    # 区域优先用 UIA 给的选区矩形，其次用这次拖选/双击的起止点。
+
+    $looksLikeBrokenLatin = ($text -and $text -match '[A-Za-z]' -and $text -notmatch '[\u4e00-\u9fff]' -and $text -notmatch '\s' -and $text.Length -ge 8)
+    $ocrHasSpaces = $false
     $ocrBox = $null
     if ($script:Anchor) {
         $ocrBox = $script:Anchor
@@ -1066,22 +1052,41 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
             bottom = [Math]::Max($pressPoint.Y, $point.Y)
         }
     }
-    $looksLikeBrokenLatin = ($text -match '[A-Za-z]' -and $text -notmatch '[一-鿿]' -and $text -notmatch '\s' -and $text.Length -ge 8)
-    if (-not $text -or $looksLikeBrokenLatin) {
-        if ($ocrBox) {
-            $ocrText = ''
-            try { $ocrText = Get-TextViaOcr $ocrBox.left $ocrBox.top $ocrBox.right $ocrBox.bottom } catch { $ocrText = '' }
-            if ($ocrText) {
-                $ocrText = $ocrText.Trim()
-                # OCR 比现有文本更像话（有词间空格，或原文本干脆是空的）才采用
-                if ((-not $text) -or ($ocrText -match '\s' -and $ocrText.Length -ge [Math]::Min(4, $text.Length))) {
-                    $text = $ocrText
-                    $source = 'ocr'
-                    Write-Log ('ocr accepted chars=' + $ocrText.Length + ' box=' + [int]$ocrBox.left + ',' + [int]$ocrBox.top + ',' + [int]$ocrBox.right + ',' + [int]$ocrBox.bottom)
-                }
+
+    # 需要 OCR 的两类情况：完全没文字（图片型 PDF / 扫描件）、拉丁文本丢了空格或被截断了首字。
+    # 这里不再为了补空格去注入 Ctrl+C —— 那会干扰用户自己的复制。
+    if ($ocrBox -and (-not $text -or $looksLikeBrokenLatin)) {
+        $ocrText = ''
+        try { $ocrText = Get-TextViaOcr $ocrBox.left $ocrBox.top $ocrBox.right $ocrBox.bottom } catch { $ocrText = '' }
+        if ($ocrText) { $ocrText = $ocrText.Trim() }
+        if ($ocrText) {
+            $ocrHasSpaces = ($ocrText -match '\s')
+            if (-not $text) {
+                $text = $ocrText
+                $source = 'ocr'
+            } elseif ($ocrHasSpaces -and $ocrText.Length -ge [Math]::Max(4, [int]($text.Length * 0.5))) {
+                # UIA 粘成一串 / 少了首字母时，OCR 通常更准（它按画面读，不会丢空格和字）
+                $text = $ocrText
+                $source = 'uia+ocr'
             }
         }
+        if ($source -eq 'uia' -and -not $ocrHasSpaces -and $looksLikeBrokenLatin) {
+            $text = Restore-WordSpacing $text
+            $source = 'uia-respaced'
+        }
     }
+
+    # 兜底顺序里剪贴板默认关闭：只有显式开启、且 UIA 完全没拿到文字时才用一次
+    if (-not $text -and $AllowClipboard) {
+        $source = 'clipboard'
+        try { $text = Get-SelectionViaClipboard ($hwnd) } catch { $text = '' }
+        if ($text) { $text = $text.Trim() }
+        if ($text -and $text -notmatch '\s' -and $text.Length -ge 8) {
+            $text = Restore-WordSpacing $text
+            $source = 'clipboard-respaced'
+        }
+    }
+
     if (-not $text) { return }
     $text = $text.Trim()
     if ($text.Length -lt 2) { return }
@@ -1460,7 +1465,8 @@ try {
                 $isDouble = ((($now - $script:LastClickAt) -lt 450) -and ($dist -lt 8))
             }
             if ($moved -ge 5 -or $isDouble) {
-                try { Invoke-Gesture $pos $script:DownPoint } catch { Write-Log ('gesture failed: ' + $_.Exception.Message) }
+                # 先压 120ms：如果用户紧接着按 Ctrl（想复制），就别弹翻译打扰他
+                $script:PendingGesture = @{ point = $pos; press = $script:DownPoint; at = $now }
             }
             $script:LastClickAt = $now
             $script:LastClickPoint = $pos
@@ -1472,6 +1478,16 @@ try {
             elseif (($now - $script:HiddenAt) -gt 20000) { Hide-Overlay }
         } elseif ($script:Task) {
             $script:HiddenAt = 0
+        }
+
+        if ($script:PendingGesture -and (($now - $script:PendingGesture.at) -ge 120)) {
+            $gesture = $script:PendingGesture
+            $script:PendingGesture = $null
+            if (([DTWin32]::GetAsyncKeyState(0x11) -band 0x8000) -ne 0) {
+                Write-Log 'gesture skipped: ctrl held (copy intent)'
+            } else {
+                try { Invoke-Gesture $gesture.point $gesture.press } catch { Write-Log ('gesture failed: ' + $_.Exception.Message) }
+            }
         }
 
         [System.Windows.Forms.Application]::DoEvents()

@@ -616,6 +616,8 @@ export const DEFAULTS = Object.freeze({
   maxPdfBytes: 60 * 1024 * 1024,
   /** 生成双语 PDF 用的中文字体路径（留空 = 自动找系统字体）。 */
   pdfFont: '',
+  /** 系统级划译的剪贴板兜底：默认关（注入 Ctrl+C 会干扰用户自己的复制）。 */
+  clipboardFallback: false,
   defaultTarget: 'auto',
   tone: 'natural',
 })
@@ -643,6 +645,7 @@ export function normalizeConfig(raw) {
     maxUploadBytes: numberOr(input.maxUploadBytes, DEFAULTS.maxUploadBytes, 1024, 64 * 1024 * 1024),
     maxPdfBytes: numberOr(input.maxPdfBytes, DEFAULTS.maxPdfBytes, 1024 * 1024, 256 * 1024 * 1024),
     pdfFont: typeof input.pdfFont === 'string' ? input.pdfFont : DEFAULTS.pdfFont,
+    clipboardFallback: input.clipboardFallback === true,
     defaultTarget: LANGS[target] || target === 'auto' ? target : DEFAULTS.defaultTarget,
     tone: TONES[String(input.tone || '')] ? String(input.tone) : DEFAULTS.tone,
     temperature: numberOr(input.temperature, 0.2, 0, 1.5),
@@ -731,7 +734,7 @@ async function unloadModel(cfg, signal) {
 
 /* ──────────────────────────── 外部划译（系统级伴生进程） ──────────────────────────── */
 
-function helperCommand(port, target, tone) {
+function helperCommand(port, target, tone, allowClipboard = false) {
   const powershell = join(process.env.SystemRoot || 'C:\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
   const exe = existsSync(powershell) ? powershell : 'powershell.exe'
   return {
@@ -755,6 +758,7 @@ function helperCommand(port, target, tone) {
       HELPER_LOG,
       '-ThemePath',
       HELPER_THEME,
+      ...(allowClipboard ? ['-AllowClipboard'] : []),
     ],
   }
 }
@@ -824,7 +828,7 @@ function startExternal(state, body) {
   if (running && ext.port === port && ext.target === target && ext.tone === tone) return externalSnapshot(state)
 
   stopExternal(state)
-  const command = helperCommand(port, target, tone)
+  const command = helperCommand(port, target, tone, cfg.clipboardFallback === true)
   let child
   try {
     child = spawn(command.exe, command.args, { windowsHide: true, stdio: 'ignore', detached: false })

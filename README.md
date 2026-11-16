@@ -21,7 +21,8 @@
 | **PDF 翻译** | 原版式写回：默认「覆盖」（译文替换原文）或「对照」（每页原文后插译文页）；扫描页可 OCR |
 | **模型管理** | 工作台里看服务状态、切换模型、加载/钉住/卸载模型；自动跟随 DSH 主题 |
 
-取词（系统级）按 **UI Automation → 剪贴板 → OCR** 三档回退，所以图片型 PDF、扫描件也能翻。
+取词（系统级）按 **UI Automation → OCR →（可选）剪贴板** 回退。PDF 文本层丢空格/首字母时用
+**OCR 重读选区**修复，不碰剪贴板（避免干扰你正常复制）；扫描件也因此能翻。
 
 ## 平台支持
 
@@ -29,7 +30,7 @@
 |---|---|---|
 | 页内划译、文本、文件翻译 | ✅ | ✅ |
 | PDF 翻译（覆盖 / 对照） | ✅ | ✅（纯 JS：pdf.js + pdf-lib；需能安装 npm 依赖） |
-| 系统级划译（任意应用） | ✅（UI Automation + 剪贴板 + 原生浮窗） | —（插件会明确提示，不影响页内划译） |
+| 系统级划译（任意应用） | ✅（UI Automation + OCR + 原生浮窗） | —（插件会明确提示，不影响页内划译） |
 | OCR 兜底 | ✅（系统自带 WinRT OCR） | —（跟随系统级划译） |
 
 系统级划译不安装任何额外运行时：脚本用系统自带的 Windows PowerShell 5.1，
@@ -115,6 +116,15 @@ dsh plugin --profile web add dsh-translate
 - **已知边界**：多栏/目录页的段落切分是启发式的（公式多的教科书偶有错位）；OCR 只有 Windows 可用；
   超长文档解析较慢（约 12ms/页）；对照模式会把文件体积翻倍。
 
+### 取词与复制（系统级划译）
+
+- 顺序：**UI Automation →（拉丁文本没空格/缺字时）OCR 重读 → 大小写补空格**；
+  日志里对应的 `source=` 是 `uia` / `uia+ocr` / `uia-respaced` / `ocr`。
+- **默认不碰剪贴板**：旧版本会用「注入 Ctrl+C 读剪贴板」来补空格，会干扰你自己的复制，现已改为 OCR。
+  确实需要旧行为可在配置里开 `clipboardFallback: true`；开了之后也只在自己写的那次剪贴板上还原，
+  期间你自己按的 Ctrl+C 不会被覆盖。
+- **复制优先**：松手后等 120ms 再取词，这期间按了 Ctrl（想复制）就跳过翻译。
+
 ## 配置
 
 默认值在 `cordis.patch.yml` 的 `config` 里。要覆盖，把你的字段写进 profile 的 patch（按 `id` 覆盖整块 config）：
@@ -140,6 +150,7 @@ dsh plugin --profile web add dsh-translate
 | `maxUploadBytes` | `12582912` | 上传文件大小上限（12 MB） |
 | `maxPdfBytes` | `62914560` | PDF 原文件上限（60 MB） |
 | `pdfFont` | `''` | 生成 PDF 用的中文字体路径（留空自动找系统字体） |
+| `clipboardFallback` | `false` | 系统级划译的剪贴板兜底（默认关，避免干扰复制） |
 | `defaultTarget` | `auto` | 默认目标语言 |
 | `tone` | `natural` | 默认语气 |
 
