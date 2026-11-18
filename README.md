@@ -40,6 +40,7 @@ OCR 用系统自带的 `Windows.Media.Ocr`，浮窗是自绘的原生窗口。
 ## 前置条件
 
 1. **Ollama**（≥ 0.3）在本机运行：默认地址 `http://127.0.0.1:11434`。
+   没在跑也没关系——**插件会自动拉起**（默认开，最多等 25 秒）；找不到 `ollama.exe` 时可在配置里指定 `ollamaExe`。
 2. **一个翻译模型**。推荐：
    ```bash
    ollama pull kaelri/hy-mt2:1.8b     # Hunyuan-MT2 1.8B，约 1.5 GB，加载快
@@ -168,6 +169,9 @@ dsh plugin --profile web add dsh-translate
 | `maxPdfBytes` | `62914560` | PDF 原文件上限（60 MB） |
 | `pdfFont` | `''` | 生成 PDF 用的中文字体路径（留空自动找系统字体） |
 | `clipboardFallback` | `true` | 剪贴板层是否允许「注入一次 Ctrl+C」；`false` = 只被动读，绝不注入 |
+| `autoStartOllama` | `true` | 连不上 Ollama 时自动 `ollama serve` 并等待就绪 |
+| `ollamaExe` | `''` | 指定 ollama.exe 路径（留空自动找 PATH / 常见安装目录） |
+| `ollamaStartTimeoutMs` | `25000` | 等待 Ollama 启动完成的上限 |
 | `defaultTarget` | `auto` | 默认目标语言 |
 | `tone` | `natural` | 默认语气 |
 
@@ -205,6 +209,7 @@ powershell -NoProfile -STA -ExecutionPolicy Bypass -File helper/dsh-translate-ca
 | 提示「本地还没有翻译模型」 | 复制命令 `ollama pull …`，或去设置换模型 |
 | 系统级划译没反应 | 看日志最后几行：`gesture app=… source=…`；确认划译总开关与「外部」开关都开 |
 | PDF 出来是 `TheInnerProduct` 这类连写 | 正常：会自动走剪贴板/OCR/补空格；若仍不行把日志发我 |
+| 提示「连不上本地 Ollama」 | 点提示条上的「启动 Ollama」；或确认 `ollama serve` 能正常启动、必要时配置 `ollamaExe` |
 | 图片型 PDF / 扫描件 | 走 OCR（日志 `source=ocr`）；OCR 语言包缺失时会在日志写 `ocr engine unavailable` |
 | 翻译很慢 | 冷加载 2~3 秒正常；把 `keepAlive` 调成 `5m` 可减少冷启动 |
 

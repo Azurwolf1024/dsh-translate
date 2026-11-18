@@ -1247,14 +1247,53 @@ window.__ModuleLoader__.load({
 		function SetupNotice() {
 			var s = useStore();
 			var status = s.status;
+			var startPair = useState('idle');
+			var startState = startPair[0];
+			var setStartState = startPair[1];
 			if (!status) return null;
 			if (status.reachable === false) {
+				function startOllama() {
+					if (startState === 'starting') return;
+					setStartState('starting');
+					api('startOllama')
+						.then(function (result) {
+							setStartState('idle');
+							if (result && result.ok) {
+								toast('Ollama 已启动');
+								refreshStatus();
+							} else {
+								toast((result && result.error) || '启动失败：找不到 ollama.exe 或启动超时');
+							}
+						})
+						.catch(function (failure) {
+							setStartState('idle');
+							toast(failure.message || String(failure));
+						});
+				}
 				return h(
 					'div',
 					{ className: 'dstr-notice err' },
 					h('span', { className: 'dstr-notice-main' }, '连不上本地 Ollama（' + (status.baseURL || '127.0.0.1:11434') + '）'),
-					h('span', { className: 'dstr-hint' }, '先装好并启动 Ollama（`ollama serve` 或打开 Ollama 应用），再点右边重新检测。'),
+					h(
+						'span',
+						{ className: 'dstr-hint' },
+						status.autoStartOllama === false
+							? '自动启动已关闭；可以点右边手动启动，或在配置里把 autoStartOllama 打开。'
+							: '点「启动 Ollama」自动拉起本地服务（也可以自己执行 ollama serve）。'
+					),
 					h('span', { className: 'dstr-spacer' }),
+					status.autoStartOllama === false
+						? null
+						: h(
+								'button',
+								{
+									type: 'button',
+									className: 'dstr-btn primary',
+									disabled: startState === 'starting',
+									onClick: startOllama
+								},
+								startState === 'starting' ? '启动中…' : '启动 Ollama'
+							),
 					h('button', { type: 'button', className: 'dstr-btn', onClick: refreshStatus }, '重新检测')
 				);
 			}

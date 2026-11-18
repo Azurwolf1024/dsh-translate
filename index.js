@@ -618,6 +618,12 @@ export const DEFAULTS = Object.freeze({
   pdfFont: '',
   /** 系统级划译的剪贴板层：true = 允许在需要时注入一次 Ctrl+C（默认）；false = 只被动读、绝不注入。 */
   clipboardFallback: true,
+  /** Ollama 没在跑时是否自动拉起（默认开）。 */
+  autoStartOllama: true,
+  /** 显式指定 ollama.exe 路径（留空自动找）。 */
+  ollamaExe: '',
+  /** 等待 Ollama 启动完成的上限。 */
+  ollamaStartTimeoutMs: 25000,
   defaultTarget: 'auto',
   tone: 'natural',
 })
@@ -646,6 +652,9 @@ export function normalizeConfig(raw) {
     maxPdfBytes: numberOr(input.maxPdfBytes, DEFAULTS.maxPdfBytes, 1024 * 1024, 256 * 1024 * 1024),
     pdfFont: typeof input.pdfFont === 'string' ? input.pdfFont : DEFAULTS.pdfFont,
     clipboardFallback: input.clipboardFallback !== false,
+    autoStartOllama: input.autoStartOllama !== false,
+    ollamaExe: typeof input.ollamaExe === 'string' ? input.ollamaExe : DEFAULTS.ollamaExe,
+    ollamaStartTimeoutMs: numberOr(input.ollamaStartTimeoutMs, DEFAULTS.ollamaStartTimeoutMs, 3000, 120000),
     defaultTarget: LANGS[target] || target === 'auto' ? target : DEFAULTS.defaultTarget,
     tone: TONES[String(input.tone || '')] ? String(input.tone) : DEFAULTS.tone,
     temperature: numberOr(input.temperature, 0.2, 0, 1.5),
@@ -689,6 +698,79 @@ async function requestJson(url, { method = 'GET', body, signal, timeoutMs = 3000
   }
   if (data === null) throw new TranslateError('OLLAMA_HTTP', 'Ollama 返回了无法解析的响应')
   return data
+}
+
+const OLLAMA_BIN = process.platform === 'win32' ? 'ollama.exe' : 'ollama'
+
+/** 自动找 ollama 可执行文件（环境变量/配置/PATH/常见安装路径）。 */
+export function findOllamaExe(cfg = DEFAULTS) {
+  const candidates = []
+  if (process.env.OLLAMA_EXE) candidates.push(process.env.OLLAMA_EXE)
+  if (cfg && cfg.ollamaExe) candidates.push(cfg.ollamaExe)
+  if (process.env.LOCALAPPDATA) candidates.push(join(process.env.LOCALAPPDATA, 'Programs', 'Ollama', OLLAMA_BIN))
+  if (process.env.ProgramFiles) candidates.push(join(process.env.ProgramFiles, 'Ollama', OLLAMA_BIN))
+  if (process.env['ProgramFiles(x86)']) candidates.push(join(process.env['ProgramFiles(x86)'], 'Ollama', OLLAMA_BIN))
+  for (const dir of String(process.env.PATH || '').split(process.platform === 'win32' ? ';' : ':')) {
+    if (dir) candidates.push(join(dir, OLLAMA_BIN))
+  }
+  for (const candidate of candidates) {
+    try {
+      if (candidate && existsSync(candidate)) return candidate
+    } catch {
+      /* 忽略不可访问的路径 */
+    }
+  }
+  return null
+}
+
+/** 拉起 `ollama serve`（detached，不占终端），并等端口可用。 */
+async function startOllama(state, cfg) {
+  if (state.ollamaStarting) return state.ollamaStarting
+  state.ollamaStarting = (async () => {
+    const exe = findOllamaExe(cfg)
+    if (!exe) {
+      throw new TranslateError('OLLAMA_NOT_FOUND', '找不到 ollama.exe：请先安装 Ollama，或在配置里设置 ollamaExe')
+    }
+    state.log('info', `自动启动 Ollama：${exe} serve`)
+    try {
+      const child = spawn(exe, ['serve'], { detached: true, stdio: 'ignore', windowsHide: true })
+      if (typeof child.unref === 'function') child.unref()
+    } catch (error) {
+      throw new TranslateError('OLLAMA_START_FAILED', `启动 Ollama 失败：${error?.message || error}`)
+    }
+    const deadline = Date.now() + Math.max(3000, cfg.ollamaStartTimeoutMs || 25000)
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 600))
+      try {
+        await listTags(cfg, undefined)
+        state.log('info', 'Ollama 已启动')
+        return true
+      } catch {
+        /* 还在启动，继续等 */
+      }
+    }
+    return false
+  })().finally(() => {
+    state.ollamaStarting = null
+  })
+  return state.ollamaStarting
+}
+
+/** 需要模型前调用：连不上就尝试自动拉起。返回是否可用。 */
+async function ensureOllama(state, cfg, signal) {
+  try {
+    await listTags(cfg, signal)
+    return true
+  } catch {
+    /* 连不上 */
+  }
+  if (!cfg.autoStartOllama) return false
+  try {
+    return await startOllama(state, cfg)
+  } catch (error) {
+    state.log('warn', `自动启动 Ollama 失败：${error?.message || error}`)
+    return false
+  }
 }
 
 async function listTags(cfg, signal) {
@@ -903,6 +985,8 @@ async function statusOf(state, signal, cfg = state.cfg) {
     installed: false,
     loaded: false,
     pinned: state.pinned,
+    autoStartOllama: cfg.autoStartOllama,
+    ollamaExe: findOllamaExe(cfg),
     keepAlive: cfg.keepAlive,
     idleUnloadMs: cfg.idleUnloadMs,
     models: [],
@@ -1279,8 +1363,25 @@ async function handleAction(state, body, signal) {
     return { ok: true, status: await statusOf(state, signal, applyOverrides(state, body)) }
   }
 
+  // 用户点「启动 Ollama」/页面发现连不上时调用：拉起服务并等它就绪
+  if (action === 'startOllama') {
+    const cfg = applyOverrides(state, body)
+    let started = false
+    let error = null
+    try {
+      started = await startOllama(state, cfg)
+    } catch (failure) {
+      error = failure?.message || String(failure)
+    }
+    state.lastActivity = Date.now()
+    const status = await statusOf(state, signal, cfg)
+    return { ok: status.reachable, started, error, status }
+  }
+
   if (action === 'load') {
-    const status = await warmup(state, applyOverrides(state, body), signal)
+    const cfg = applyOverrides(state, body)
+    await ensureOllama(state, cfg, signal).catch(() => {})
+    const status = await warmup(state, cfg, signal)
     state.lastActivity = Date.now()
     return { ok: true, status }
   }
@@ -1439,6 +1540,7 @@ async function handleAction(state, body, signal) {
     if (text.length > cfg.maxTextChars) {
       throw new TranslateError('TEXT_TOO_LONG', `文本过长（${text.length} 字符，上限 ${cfg.maxTextChars}）`)
     }
+    await ensureOllama(state, cfg, signal).catch(() => {})
     const segments = splitSegments(text, cfg.chunkChars)
     const started = Date.now()
     const result = await translateSegments({

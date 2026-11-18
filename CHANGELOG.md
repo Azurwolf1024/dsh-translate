@@ -2,6 +2,18 @@
 
 本项目从「个人可用的翻译插件」演进到「可分享安装」的过程记录。版本号与 `package.json` 同步。
 
+## 1.7.0 — 自动启动本地 Ollama
+
+- 翻译前检测不到 Ollama 时，**自动拉起 `ollama serve`** 并等它就绪（默认开，最多等 25s），
+  不再只是报「连不上本地 Ollama」。
+- 新增 action `startOllama`：连不上时页面顶部提示条会出现「启动 Ollama」按钮，点一下即可拉起并重连。
+- 自动找 ollama.exe：`OLLAMA_EXE` 环境变量 → 配置 `ollamaExe` → PATH → `%LOCALAPPDATA%\Programs\Ollama`
+  → `Program Files\Ollama` → `Program Files (x86)\Ollama`。
+- 新增配置：`autoStartOllama`（默认 true）、`ollamaExe`（留空自动找）、`ollamaStartTimeoutMs`（默认 25000）。
+- status 返回 `autoStartOllama` 与解析到的 `ollamaExe`，方便排查。
+- 并发保护：多个请求同时检测到服务未起时，只拉起一次，其余等同一个 Promise。
+- 测试：新增 `findOllamaExe`/配置默认值断言；实测杀掉 ollama 后直接调 translate，自动拉起并成功返回译文。
+
 ## 1.6.2 — 修「管理员应用里划译不生效」（含 WorkBuddy 这类应用）
 
 - **根因一（代码 bug）**：UIA 拿不到选区矩形时，`Set-AnchorFromRects $point $null` 把锚点设成 **0×0 点框**，

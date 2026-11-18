@@ -9,10 +9,10 @@
  * 再把真实的 HTTP handler 当普通函数驱动。
  */
 import { EventEmitter } from 'node:events'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { apply, __internal, looksUntranslated, ROUTE_PATH } from '../index.js'
+import { apply, __internal, findOllamaExe, looksUntranslated, normalizeConfig, ROUTE_PATH } from '../index.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const fixtures = join(here, 'fixtures')
@@ -361,6 +361,16 @@ const routeBuild = await callRoute(route, {
   }),
 })
 check('路由 pdfBuild 返回 PDF base64', routeBuild.json?.ok === true && String(routeBuild.json.dataBase64 || '').length > 100, JSON.stringify(routeBuild.json?.error))
+
+const ollamaExe = findOllamaExe()
+check(
+  '能找到 ollama.exe（找不到也算合法，返回 null）',
+  ollamaExe === null || (typeof ollamaExe === 'string' && existsSync(ollamaExe)),
+  String(ollamaExe)
+)
+check('配置默认自动启动 Ollama', normalizeConfig({}).autoStartOllama === true)
+check('autoStartOllama 可关闭', normalizeConfig({ autoStartOllama: false }).autoStartOllama === false)
+check('ollamaExe 配置可透传', normalizeConfig({ ollamaExe: 'D:/x/ollama.exe' }).ollamaExe === 'D:/x/ollama.exe')
 
 check('effect 清理函数已登记', effects.length >= 2)
 for (const disposer of effects) if (typeof disposer === 'function') disposer()
