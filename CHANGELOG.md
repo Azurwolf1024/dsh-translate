@@ -2,6 +2,21 @@
 
 本项目从「个人可用的翻译插件」演进到「可分享安装」的过程记录。版本号与 `package.json` 同步。
 
+## 1.6.2 — 修「管理员应用里划译不生效」（含 WorkBuddy 这类应用）
+
+- **根因一（代码 bug）**：UIA 拿不到选区矩形时，`Set-AnchorFromRects $point $null` 把锚点设成 **0×0 点框**，
+  OCR 层又优先用它 → 截到 0×0 区域，OCR 必然失败（拖拽框也被忽略）。现在：拖拽用拖拽框、双击/点选用词框。
+- **根因二（系统限制）**：目标应用以管理员（高完整性级别）运行时，Windows UIPI 会拦截跨完整性的
+  UI Automation 查询和模拟按键（Ctrl+C）。实测 WorkBuddy 主进程 token 查询被拒（err=5），而 msedge/explorer
+  正常；截屏没有被禁（display affinity=0），所以 OCR 仍可用。
+- 手势开始时重置锚点，避免沿用上一个应用的选区框截错区域。
+- 检测前台进程 token：高完整性目标**跳过**必然失败的 UIA 与模拟按键，直接走 OCR；
+  仍然取不到时弹一次「划译受限」提示（同应用只弹一次），不再静默失败。
+- 日志分因：`uia: no selection (elevated=…)` / `clipboard inject skipped: elevated target` /
+  `gesture blocked: elevated target`，方便以后排查。
+- 自检新增 `dragBoxOk` / `clickBoxOk` 逻辑断言；实测（WinForms 文本窗 + 模拟拖选）日志出现
+  `source=ocr chars=32`，证明 OCR 兜底链路可用。
+
 ## 1.6.1 — 修“开始翻译”按钮白底白字看不见
 
 - 三个主按钮（文本翻译 / 文件翻译 / PDF 翻译）原来用 `var(--dsw-alias-brand-primary)` 当背景，

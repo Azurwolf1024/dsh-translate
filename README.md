@@ -136,6 +136,10 @@ dsh plugin --profile web add dsh-translate
 日志里 `source=` 会写明走了哪条：`uia` / `clipboard` / `clipboard-passive` / `clipboard+ocr` / `ocr` / `…-respaced`。
 
 - **复制优先**：松手后等 120ms 再取词，这期间按了 Ctrl（想复制）就跳过翻译。
+- **取不到选区矩形时**：拖拽用拖拽框、双击/点选用鼠标附近的一行词框去 OCR（以前这里会截 0×0 区域，等于没兜底）。
+- **管理员应用**：目标以管理员运行时，Windows 会拦截跨权限的 UI Automation 和模拟按键（Ctrl+C），
+  这时自动降级到 OCR（截屏不受限）；仍取不到会弹一次「划译受限」提示。
+  要完整支持可让插件以管理员身份运行（以管理员启动 DSH）。
 - **完全不想被注入**：把配置 `clipboardFallback` 设为 `false` —— 剪贴板层只剩「被动读」，绝不注入。
 
 ## 配置

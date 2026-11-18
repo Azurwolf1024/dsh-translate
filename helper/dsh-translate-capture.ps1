@@ -38,7 +38,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '1.5.2'
+$script:ScriptVersion = '1.6.2'
 $script:ThemePath = $ThemePath
 
 # ───────────────────────────── 日志 ─────────────────────────────
@@ -83,6 +83,11 @@ public static class DTWin32 {
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern uint GetDpiForSystem();
+
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(IntPtr handle);
+    [DllImport("advapi32.dll", SetLastError = true)] public static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)] public static extern bool GetTokenInformation(IntPtr token, int cls, out uint info, int len, out int ret);
 }
 
 /** 无边框卡片窗口：CS_DROPSHADOW 让 DWM 给一层系统阴影，双缓冲避免自绘闪烁。 */
@@ -136,6 +141,7 @@ $script:ScrollOffset = 0
 $script:LastSource = ''
 $script:PendingGesture = $null
 $script:GestureClipSeq = 0
+$script:ElevatedHintShown = @{}
 $script:OcrEngine = $null
 $script:OcrReady = 0
 $script:Anchor = $null
@@ -1015,6 +1021,68 @@ function Set-AnchorFromRects([DTWin32+POINT]$point, $rects) {
     $script:Anchor = @{ left = $left; top = $top; right = $right; bottom = $bottom }
 }
 
+<# 前台窗口的进程是否以更高完整性级别运行（管理员/受保护进程）。 #>
+function Test-ElevatedTarget([IntPtr]$hwnd) {
+    if (-not $hwnd -or $hwnd -eq [IntPtr]::Zero) { return 'unknown' }
+    $targetPid = [uint32]0
+    try { [void][DTWin32]::GetWindowThreadProcessId($hwnd, [ref]$targetPid) } catch { return 'unknown' }
+    if (-not $targetPid) { return 'unknown' }
+    $handle = [IntPtr]::Zero
+    try { $handle = [DTWin32]::OpenProcess(0x1000, $false, $targetPid) } catch { return 'unknown' }
+    if ($handle -eq [IntPtr]::Zero) {
+        if ([System.Runtime.InteropServices.Marshal]::GetLastWin32Error() -eq 5) { return 'elevated' }
+        return 'unknown'
+    }
+    $token = [IntPtr]::Zero
+    $opened = $false
+    try { $opened = [DTWin32]::OpenProcessToken($handle, 0x0008, [ref]$token) } catch { $opened = $false }
+    if (-not $opened) {
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        [void][DTWin32]::CloseHandle($handle)
+        if ($err -eq 5) { return 'elevated' }
+        return 'unknown'
+    }
+    $elevation = [uint32]0
+    $returned = 0
+    $read = $false
+    try { $read = [DTWin32]::GetTokenInformation($token, 20, [ref]$elevation, 4, [ref]$returned) } catch { $read = $false }
+    [void][DTWin32]::CloseHandle($token)
+    [void][DTWin32]::CloseHandle($handle)
+    if (-not $read) { return 'unknown' }
+    if ($elevation -eq 1) { return 'elevated' }
+    return 'normal'
+}
+
+<#
+  OCR 取框：UIA 给不出选区矩形时用来截屏取词。
+   · 拖拽（位移够大）→ 用拖拽框，外扩一圈；
+   · 双击/点选 → 以鼠标为中心取一行词框。
+#>
+function Get-OcrBox([DTWin32+POINT]$point, $pressPoint) {
+    $scale = if ($script:Scale -gt 0) { $script:Scale } else { 1.0 }
+    $pad = [int][Math]::Ceiling(6 * $scale)
+    if ($pressPoint) {
+        $dx = [Math]::Abs($point.X - $pressPoint.X)
+        $dy = [Math]::Abs($point.Y - $pressPoint.Y)
+        if ($dx -ge [int](6 * $scale) -or $dy -ge [int](6 * $scale)) {
+            return @{
+                left   = [Math]::Min($point.X, $pressPoint.X) - $pad
+                top    = [Math]::Min($point.Y, $pressPoint.Y) - $pad
+                right  = [Math]::Max($point.X, $pressPoint.X) + $pad
+                bottom = [Math]::Max($point.Y, $pressPoint.Y) + $pad
+            }
+        }
+    }
+    $halfW = [int][Math]::Ceiling(80 * $scale)
+    $halfH = [int][Math]::Ceiling(12 * $scale)
+    return @{
+        left   = $point.X - $halfW
+        top    = $point.Y - $halfH
+        right  = $point.X + $halfW
+        bottom = $point.Y + $halfH
+    }
+}
+
 function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
     $hwnd = [DTWin32]::GetForegroundWindow()
     if ($hwnd -eq [IntPtr]::Zero) { return }
@@ -1024,10 +1092,16 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
     if ($processName -imatch 'dsh-translate-capture') { return }
     if ($processName -imatch '^(DeepSeek Harness|dsh)') { return }
 
+    # 每次手势都从干净状态开始：否则会沿用上一个应用/上一次的选区框（OCR 会截错区域）
+    $script:Anchor = $null
+    # 目标进程提权时：UIA 跨完整性拿不到控件树，模拟按键也会被 UIPI 丢弃
+    $elevated = Test-ElevatedTarget $hwnd
+    if ($elevated -eq 'elevated') { Write-Log ('target elevated app=' + $processName) }
+
     $pointObj = New-Object System.Windows.Point($point.X, $point.Y)
     $text = ''
     $source = 'uia'
-    if (-not $script:NoUia) {
+    if (-not $script:NoUia -and $elevated -ne 'elevated') {
         for ($attempt = 1; $attempt -le 2; $attempt++) {
             $found = $null
             try { $found = Get-SelectionViaUia $pointObj } catch { $found = $null }
@@ -1045,7 +1119,9 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
             Start-Sleep -Milliseconds 160
         }
     }
-    if (-not $script:Anchor) { Set-AnchorFromRects $point $null }
+    if (-not $text) { Write-Log ('uia: no selection (elevated=' + $elevated + ')') }
+    # UIA 没给矩形：拖拽用拖拽框、双击用词框——否则 OCR 会截到 0×0 区域
+    if (-not $script:Anchor) { $script:Anchor = Get-OcrBox $point $pressPoint }
     # 先 Trim 再判断有没有词间空白（PDF 选区常以 CRLF 结尾）
     if ($text) { $text = $text.Trim() }
 
@@ -1076,6 +1152,8 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
                 $text = $clipText.Trim()
                 $source = 'clipboard-passive'
             }
+        } elseif ($elevated -eq 'elevated') {
+            Write-Log 'clipboard inject skipped: elevated target'
         } elseif ($AllowClipboard -and (([DTWin32]::GetAsyncKeyState(0x11) -band 0x8000) -eq 0)) {
             # 需要主动取词时才注入一次（存还原只针对自己写的那次）
             $clipText = ''
@@ -1105,7 +1183,17 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
         }
     }
 
-    if (-not $text) { return }
+    if (-not $text) {
+        if ($elevated -eq 'elevated') {
+            $label = $processName
+            if (-not $script:ElevatedHintShown[$label]) {
+                $script:ElevatedHintShown[$label] = $true
+                Show-Overlay '划译受限' '' ('该应用以管理员权限运行（' + $label + '）：系统不允许读取它的选区，也不允许模拟 Ctrl+C。可先按 Ctrl+C 复制再用「文本翻译」，或以管理员身份重启 DSH 恢复完整划译。') '' $point.X $point.Y
+            }
+            Write-Log ('gesture blocked: elevated target app=' + $label)
+        }
+        return
+    }
     $text = $text.Trim()
     if ($text.Length -lt 2) { return }
     if ($text.Length -gt $MaxChars) { $text = $text.Substring(0, $MaxChars) }
@@ -1382,11 +1470,15 @@ if ($SelfTest) {
         $untouched = Restore-WordSpacing 'u and v are vectors'
         Set-AnchorFromRects ([DTWin32+POINT]@{ X = 100; Y = 200 }) @(@{ left = 90; top = 180; right = 400; bottom = 260 })
         $anchorOk = ($script:Anchor.left -eq 90 -and $script:Anchor.bottom -eq 260)
+        $dragBox = Get-OcrBox ([DTWin32+POINT]@{ X = 300; Y = 400 }) ([DTWin32+POINT]@{ X = 100; Y = 200 })
+        $clickBox = Get-OcrBox ([DTWin32+POINT]@{ X = 300; Y = 400 }) $null
         $result.logic = @{
             respace     = $spaced
             respaceOk   = ($spaced -eq 'The Inner Product')
             keepSpaces  = ($untouched -eq 'u and v are vectors')
             anchorOk    = $anchorOk
+            dragBoxOk   = ($dragBox.left -lt 100 -and $dragBox.right -gt 300 -and ($dragBox.right - $dragBox.left) -gt 200)
+            clickBoxOk  = (($clickBox.right - $clickBox.left) -ge [int](100 * $script:Scale) -and $clickBox.top -lt 400 -and $clickBox.bottom -gt 400)
         }
 
         $result.uia = ($null -ne [System.Windows.Automation.AutomationElement])
@@ -1398,7 +1490,7 @@ if ($SelfTest) {
         $resp = Invoke-WebRequest -Uri $script:ApiUrl -Method Post -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($payload)) -UseBasicParsing -TimeoutSec 60
         $parsed = $resp.Content | ConvertFrom-Json
         $result.translate = @{ ok = $parsed.ok; text = $parsed.text; target = $parsed.targetLanguage }
-        $result.ok = ($result.httpStatus -and $parsed.ok -eq $true -and $result.sourceLint -and $result.logic.respaceOk -and $result.logic.keepSpaces -and $result.logic.anchorOk)
+        $result.ok = ($result.httpStatus -and $parsed.ok -eq $true -and $result.sourceLint -and $result.logic.respaceOk -and $result.logic.keepSpaces -and $result.logic.anchorOk -and $result.logic.dragBoxOk -and $result.logic.clickBoxOk)
     } catch {
         $result.error = $_.Exception.Message
     }
