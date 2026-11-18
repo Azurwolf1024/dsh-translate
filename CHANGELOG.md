@@ -2,6 +2,17 @@
 
 本项目从「个人可用的翻译插件」演进到「可分享安装」的过程记录。版本号与 `package.json` 同步。
 
+## 1.7.1 — 修「以管理员运行 DSH 后仍划不了 WorkBuddy」
+
+- 根因：`Test-ElevatedTarget` 只判断「目标是否提权」，没判断「我们自己是否也是管理员」。
+  DSH 以管理员运行后，helper 同样是管理员，WorkBuddy（同为管理员）其实**可以**读 UIA、也可以注入 Ctrl+C，
+  但代码一律当成「被系统拦截」，于是跳过 UIA 和剪贴板、只剩 OCR，OCR 取不到时就弹「划译受限」。
+- 修法：记录自身权限（`$script:SelfElevated`）；只有目标完整性级别**高于我们**才算被拦截。
+  同级管理员应用恢复正常：UIA 不行就走剪贴板。
+- 日志：拦截日志带上 `selfElevated=`；自检结果带 `selfElevated` 字段。
+- 实测（DSH 管理员 + helper 1.6.3）：
+  · 对 WorkBuddy 模拟 Ctrl+A/Ctrl+C → 剪贴板序号 910→918、读到 3912 字符（以前被 UIPI 丢弃）；
+  · 模拟拖选 → 日志 `uia: no selection (elevated=normal)` + `gesture app=WorkBuddy source=clipboard chars=3900`。
 ## 1.7.0 — 自动启动本地 Ollama
 
 - 翻译前检测不到 Ollama 时，**自动拉起 `ollama serve`** 并等它就绪（默认开，最多等 25s），
@@ -13,6 +24,7 @@
 - status 返回 `autoStartOllama` 与解析到的 `ollamaExe`，方便排查。
 - 并发保护：多个请求同时检测到服务未起时，只拉起一次，其余等同一个 Promise。
 - 测试：新增 `findOllamaExe`/配置默认值断言；实测杀掉 ollama 后直接调 translate，自动拉起并成功返回译文。
+
 
 ## 1.6.2 — 修「管理员应用里划译不生效」（含 WorkBuddy 这类应用）
 

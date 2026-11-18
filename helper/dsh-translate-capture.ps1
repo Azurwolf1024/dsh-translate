@@ -38,7 +38,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '1.6.2'
+$script:ScriptVersion = '1.7.1'
 $script:ThemePath = $ThemePath
 
 # ───────────────────────────── 日志 ─────────────────────────────
@@ -152,6 +152,12 @@ $script:Theme = $null
 $script:ThemeAt = [DateTime]::MinValue
 $script:FontScale = 0
 $script:Scale = 1.0
+$script:SelfElevated = 0
+try {
+    if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        $script:SelfElevated = 1
+    }
+} catch { }
 $script:HiddenAt = 0
 $script:TerminalClasses = @('ConsoleWindowClass', 'CASCADIA_HOSTING_WINDOW_CLASS', 'mintty', 'PseudoConsoleWindow', 'PuTTY')
 
@@ -1049,7 +1055,12 @@ function Test-ElevatedTarget([IntPtr]$hwnd) {
     [void][DTWin32]::CloseHandle($token)
     [void][DTWin32]::CloseHandle($handle)
     if (-not $read) { return 'unknown' }
-    if ($elevation -eq 1) { return 'elevated' }
+    # 目标提权 + 我们自己也是管理员 = 同级别，可达。
+    # 以前这里一律返回 elevated，导致 WorkBuddy 这类管理员应用被误判成「被系统拦截」。
+    if ($elevation -eq 1) {
+        if ($script:SelfElevated -eq 1) { return 'normal' }
+        return 'elevated'
+    }
     return 'normal'
 }
 
@@ -1096,7 +1107,7 @@ function Invoke-Gesture([DTWin32+POINT]$point, [DTWin32+POINT]$pressPoint) {
     $script:Anchor = $null
     # 目标进程提权时：UIA 跨完整性拿不到控件树，模拟按键也会被 UIPI 丢弃
     $elevated = Test-ElevatedTarget $hwnd
-    if ($elevated -eq 'elevated') { Write-Log ('target elevated app=' + $processName) }
+    if ($elevated -eq 'elevated') { Write-Log ('target blocked by integrity app=' + $processName + ' selfElevated=' + $script:SelfElevated) }
 
     $pointObj = New-Object System.Windows.Point($point.X, $point.Y)
     $text = ''
@@ -1482,6 +1493,7 @@ if ($SelfTest) {
         }
 
         $result.uia = ($null -ne [System.Windows.Automation.AutomationElement])
+        $result.selfElevated = $script:SelfElevated
         $result.winforms = ($null -ne [System.Windows.Forms.Cursor])
         $statusJson = (Invoke-WebRequest -Uri $script:ApiUrl -Method Get -UseBasicParsing -TimeoutSec 10).Content
         $status = $statusJson | ConvertFrom-Json

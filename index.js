@@ -726,6 +726,13 @@ export function findOllamaExe(cfg = DEFAULTS) {
 /** 拉起 `ollama serve`（detached，不占终端），并等端口可用。 */
 async function startOllama(state, cfg) {
   if (state.ollamaStarting) return state.ollamaStarting
+  // 节流：上一次拉起失败后 30 秒内不再重复 spawn，避免「反复拉起」烦人
+  if (state.ollamaLastStartFailed && Date.now() - state.ollamaLastStartAt < 30000) {
+    state.log('warn', 'Ollama 上次启动失败，30 秒内不再重复拉起')
+    return false
+  }
+  state.ollamaLastStartAt = Date.now()
+  state.ollamaLastStartFailed = false
   state.ollamaStarting = (async () => {
     const exe = findOllamaExe(cfg)
     if (!exe) {
@@ -743,12 +750,14 @@ async function startOllama(state, cfg) {
       await new Promise((resolve) => setTimeout(resolve, 600))
       try {
         await listTags(cfg, undefined)
+        state.ollamaLastStartFailed = false
         state.log('info', 'Ollama 已启动')
         return true
       } catch {
         /* 还在启动，继续等 */
       }
     }
+    state.ollamaLastStartFailed = true
     return false
   })().finally(() => {
     state.ollamaStarting = null
@@ -961,6 +970,10 @@ function createState(cfg, ctx) {
     /** 本插件触发过加载的模型名；卸载以它为准，避免用户换模型后卸错对象。 */
     touchedModels: new Set(),
     pinned: false,
+    /** 自动拉 Ollama 的并发/节流状态。 */
+    ollamaStarting: null,
+    ollamaLastStartAt: 0,
+    ollamaLastStartFailed: false,
     inflight: new Set(),
     lastError: null,
     disposed: false,
