@@ -38,7 +38,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '1.7.1'
+$script:ScriptVersion = '1.7.2'
 $script:ThemePath = $ThemePath
 
 # ───────────────────────────── 日志 ─────────────────────────────

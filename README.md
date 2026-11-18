@@ -40,7 +40,8 @@ OCR 用系统自带的 `Windows.Media.Ocr`，浮窗是自绘的原生窗口。
 ## 前置条件
 
 1. **Ollama**（≥ 0.3）在本机运行：默认地址 `http://127.0.0.1:11434`。
-   没在跑也没关系——**插件会自动拉起**（默认开，最多等 25 秒）；找不到 `ollama.exe` 时可在配置里指定 `ollamaExe`。
+   没在跑也没关系——**插件会自动拉起**（默认开，最多等 25 秒；优先拉起带托盘图标的 `ollama app.exe`，
+   失败再退到 `ollama serve`）；找不到 `ollama.exe` 时可在配置里指定 `ollamaExe`。
 2. **一个翻译模型**。推荐：
    ```bash
    ollama pull kaelri/hy-mt2:1.8b     # Hunyuan-MT2 1.8B，约 1.5 GB，加载快
@@ -172,6 +173,7 @@ dsh plugin --profile web add dsh-translate
 | `autoStartOllama` | `true` | 连不上 Ollama 时自动 `ollama serve` 并等待就绪 |
 | `ollamaExe` | `''` | 指定 ollama.exe 路径（留空自动找 PATH / 常见安装目录） |
 | `ollamaStartTimeoutMs` | `25000` | 等待 Ollama 启动完成的上限 |
+| `ollamaLaunch` | `auto` | 自动启动方式：`auto`=优先托盘应用（带图标）、`app`、`serve`（纯后台） |
 | `defaultTarget` | `auto` | 默认目标语言 |
 | `tone` | `natural` | 默认语气 |
 

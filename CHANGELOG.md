@@ -2,6 +2,15 @@
 
 本项目从「个人可用的翻译插件」演进到「可分享安装」的过程记录。版本号与 `package.json` 同步。
 
+## 1.7.2 — 自动启动 Ollama 时优先拉起托盘应用（带图标）
+
+- 之前自动启动的是 `ollama.exe serve`（纯后台服务），**没有托盘图标**，看起来像「Ollama 没启动」。
+- 现在优先拉起 `ollama app.exe`（托盘应用，同时带起服务），并以 `explorer.exe` 启动——即使 DSH 以管理员运行，
+  Ollama 也保持用户身份，托盘图标正常出现在用户区。
+- 托盘应用 12 秒内没把服务带起来时，自动兜底 `ollama serve`。
+- 新增配置 `ollamaLaunch`：`auto`（默认，优先托盘应用）/ `app` / `serve`。
+- status 新增 `ollamaLaunch` 与解析到的 `ollamaApp` 路径。
+
 ## 1.7.1 — 修「以管理员运行 DSH 后仍划不了 WorkBuddy」
 
 - 根因：`Test-ElevatedTarget` 只判断「目标是否提权」，没判断「我们自己是否也是管理员」。

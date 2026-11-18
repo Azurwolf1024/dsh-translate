@@ -12,7 +12,7 @@ import { EventEmitter } from 'node:events'
 import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { apply, __internal, findOllamaExe, looksUntranslated, normalizeConfig, ROUTE_PATH } from '../index.js'
+import { apply, __internal, findOllamaApp, findOllamaExe, looksUntranslated, normalizeConfig, ROUTE_PATH } from '../index.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const fixtures = join(here, 'fixtures')
@@ -368,6 +368,14 @@ check(
   ollamaExe === null || (typeof ollamaExe === 'string' && existsSync(ollamaExe)),
   String(ollamaExe)
 )
+const ollamaApp = findOllamaApp()
+check(
+  '能找到 ollama 托盘应用（找不到也算合法，返回 null）',
+  ollamaApp === null || (typeof ollamaApp === 'string' && existsSync(ollamaApp)),
+  String(ollamaApp)
+)
+check('ollamaLaunch 默认 auto', normalizeConfig({}).ollamaLaunch === 'auto')
+check('ollamaLaunch 非法值回退 auto', normalizeConfig({ ollamaLaunch: 'nope' }).ollamaLaunch === 'auto')
 check('配置默认自动启动 Ollama', normalizeConfig({}).autoStartOllama === true)
 check('autoStartOllama 可关闭', normalizeConfig({ autoStartOllama: false }).autoStartOllama === false)
 check('ollamaExe 配置可透传', normalizeConfig({ ollamaExe: 'D:/x/ollama.exe' }).ollamaExe === 'D:/x/ollama.exe')

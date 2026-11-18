@@ -624,6 +624,8 @@ export const DEFAULTS = Object.freeze({
   ollamaExe: '',
   /** 等待 Ollama 启动完成的上限。 */
   ollamaStartTimeoutMs: 25000,
+  /** 自动启动方式：auto = 优先托盘应用（带图标），serve = 只起后台服务。 */
+  ollamaLaunch: 'auto',
   defaultTarget: 'auto',
   tone: 'natural',
 })
@@ -655,6 +657,7 @@ export function normalizeConfig(raw) {
     autoStartOllama: input.autoStartOllama !== false,
     ollamaExe: typeof input.ollamaExe === 'string' ? input.ollamaExe : DEFAULTS.ollamaExe,
     ollamaStartTimeoutMs: numberOr(input.ollamaStartTimeoutMs, DEFAULTS.ollamaStartTimeoutMs, 3000, 120000),
+    ollamaLaunch: ['auto', 'app', 'serve'].indexOf(String(input.ollamaLaunch)) >= 0 ? String(input.ollamaLaunch) : DEFAULTS.ollamaLaunch,
     defaultTarget: LANGS[target] || target === 'auto' ? target : DEFAULTS.defaultTarget,
     tone: TONES[String(input.tone || '')] ? String(input.tone) : DEFAULTS.tone,
     temperature: numberOr(input.temperature, 0.2, 0, 1.5),
@@ -723,7 +726,46 @@ export function findOllamaExe(cfg = DEFAULTS) {
   return null
 }
 
-/** 拉起 `ollama serve`（detached，不占终端），并等端口可用。 */
+/** 找 Ollama 托盘应用（ollama app.exe）——它同时带起服务并显示托盘图标。 */
+export function findOllamaApp(cfg = DEFAULTS) {
+  const name = 'ollama app.exe'
+  const candidates = []
+  if (process.env.OLLAMA_APP_EXE) candidates.push(process.env.OLLAMA_APP_EXE)
+  if (cfg && cfg.ollamaExe) {
+    try {
+      candidates.push(join(dirname(cfg.ollamaExe), name))
+    } catch {
+      /* 忽略非法路径 */
+    }
+  }
+  if (process.env.LOCALAPPDATA) candidates.push(join(process.env.LOCALAPPDATA, 'Programs', 'Ollama', name))
+  if (process.env.ProgramFiles) candidates.push(join(process.env.ProgramFiles, 'Ollama', name))
+  if (process.env['ProgramFiles(x86)']) candidates.push(join(process.env['ProgramFiles(x86)'], 'Ollama', name))
+  for (const candidate of candidates) {
+    try {
+      if (candidate && existsSync(candidate)) return candidate
+    } catch {
+      /* 忽略不可访问的路径 */
+    }
+  }
+  return null
+}
+
+/** 轮询 /api/tags 直到可用或超时。 */
+async function waitForTags(cfg, timeoutMs) {
+  const deadline = Date.now() + Math.max(2000, timeoutMs)
+  while (Date.now() < deadline) {
+    try {
+      await listTags(cfg, undefined)
+      return true
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 600))
+    }
+  }
+  return false
+}
+
+/** 拉起 Ollama（优先托盘应用，带图标），并等端口可用。 */
 async function startOllama(state, cfg) {
   if (state.ollamaStarting) return state.ollamaStarting
   // 节流：上一次拉起失败后 30 秒内不再重复 spawn，避免「反复拉起」烦人
@@ -734,31 +776,44 @@ async function startOllama(state, cfg) {
   state.ollamaLastStartAt = Date.now()
   state.ollamaLastStartFailed = false
   state.ollamaStarting = (async () => {
+    const timeout = Math.max(3000, cfg.ollamaStartTimeoutMs || 25000)
+    const app = cfg.ollamaLaunch === 'serve' ? null : findOllamaApp(cfg)
     const exe = findOllamaExe(cfg)
-    if (!exe) {
+    if (!app && !exe) {
       throw new TranslateError('OLLAMA_NOT_FOUND', '找不到 ollama.exe：请先安装 Ollama，或在配置里设置 ollamaExe')
     }
-    state.log('info', `自动启动 Ollama：${exe} serve`)
-    try {
-      const child = spawn(exe, ['serve'], { detached: true, stdio: 'ignore', windowsHide: true })
-      if (typeof child.unref === 'function') child.unref()
-    } catch (error) {
-      throw new TranslateError('OLLAMA_START_FAILED', `启动 Ollama 失败：${error?.message || error}`)
-    }
-    const deadline = Date.now() + Math.max(3000, cfg.ollamaStartTimeoutMs || 25000)
-    while (Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 600))
+    if (app) {
+      // 托盘应用带图标；用 explorer 拉起，避免 DSH 以管理员运行时把 Ollama 也提权
+      state.log('info', `自动启动 Ollama 托盘应用：${app}`)
       try {
-        await listTags(cfg, undefined)
+        const explorer = process.env.SystemRoot
+          ? join(process.env.SystemRoot, 'explorer.exe')
+          : 'explorer.exe'
+        const child = spawn(explorer, [app], { detached: true, stdio: 'ignore', windowsHide: false })
+        if (typeof child.unref === 'function') child.unref()
+      } catch (error) {
+        state.log('warn', `托盘应用启动失败：${error?.message || error}`)
+      }
+      if (await waitForTags(cfg, Math.min(timeout, 12000))) {
         state.ollamaLastStartFailed = false
-        state.log('info', 'Ollama 已启动')
+        state.log('info', 'Ollama 已启动（托盘应用）')
         return true
-      } catch {
-        /* 还在启动，继续等 */
+      }
+      state.log('warn', '托盘应用没带起服务，兜底启动 ollama serve')
+    }
+    if (exe) {
+      state.log('info', `自动启动 Ollama 服务：${exe} serve`)
+      try {
+        const child = spawn(exe, ['serve'], { detached: true, stdio: 'ignore', windowsHide: true })
+        if (typeof child.unref === 'function') child.unref()
+      } catch (error) {
+        throw new TranslateError('OLLAMA_START_FAILED', `启动 Ollama 失败：${error?.message || error}`)
       }
     }
-    state.ollamaLastStartFailed = true
-    return false
+    const ok = await waitForTags(cfg, timeout)
+    state.ollamaLastStartFailed = !ok
+    if (ok) state.log('info', 'Ollama 已启动')
+    return ok
   })().finally(() => {
     state.ollamaStarting = null
   })
@@ -999,7 +1054,9 @@ async function statusOf(state, signal, cfg = state.cfg) {
     loaded: false,
     pinned: state.pinned,
     autoStartOllama: cfg.autoStartOllama,
+    ollamaLaunch: cfg.ollamaLaunch,
     ollamaExe: findOllamaExe(cfg),
+    ollamaApp: findOllamaApp(cfg),
     keepAlive: cfg.keepAlive,
     idleUnloadMs: cfg.idleUnloadMs,
     models: [],
