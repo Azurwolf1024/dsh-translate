@@ -14,9 +14,10 @@
         # 翻译专用的本地小模型（Hunyuan-MT2 1.8B，Q6_K，约 1.5 GB）。
         model: 'kaelri/hy-mt2:1.8b'
         # 单次生成后模型保持驻留的时长；'0' = 生成结束立即卸载。
-        keepAlive: '5m'
-        # 空闲多久后主动卸载模型（毫秒）。0 = 关闭空闲卸载。
-        idleUnloadMs: 90000
+        # 默认长驻：模型重载会让 Ollama 启动 gpu-discover/runner 子进程，控制台会闪一下。
+        keepAlive: '2h'
+        # 空闲多久后主动卸载模型（毫秒）。0 = 关闭空闲卸载（默认常驻，避免反复重载闪控制台）。
+        idleUnloadMs: 0
         # 单次 Ollama 请求超时（毫秒）。
         timeoutMs: 120000
         # 一次翻译请求允许的最大字符数。

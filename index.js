@@ -24,6 +24,7 @@
 
 import { inflateRawSync } from 'node:zlib'
 import { spawn } from 'node:child_process'
+import { connect } from 'node:net'
 import { existsSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -606,8 +607,9 @@ const FALLBACK_PORT = 61213
 export const DEFAULTS = Object.freeze({
   baseURL: 'http://127.0.0.1:11434',
   model: 'kaelri/hy-mt2:1.8b',
-  keepAlive: '5m',
-  idleUnloadMs: 90000,
+  keepAlive: '2h',
+  /** 0 = 不自动卸载模型。默认常驻：模型每次重载会让 Ollama 启动 gpu-discover/runner 子进程，控制台会闪。 */
+  idleUnloadMs: 0,
   timeoutMs: 120000,
   maxTextChars: 20000,
   chunkChars: 1200,
@@ -751,6 +753,35 @@ export function findOllamaApp(cfg = DEFAULTS) {
   return null
 }
 
+/** 端口是否已被 Ollama 服务占用（哪怕 /api/tags 一时没响应）。 */
+function portOpen(cfg, timeoutMs = 800) {
+  return new Promise((resolve) => {
+    let settled = false
+    let socket
+    const done = (value) => {
+      if (settled) return
+      settled = true
+      try {
+        socket.destroy()
+      } catch {
+        /* 已关闭 */
+      }
+      resolve(value)
+    }
+    try {
+      const url = new URL(cfg.baseURL)
+      const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80))
+      socket = connect({ host: url.hostname, port })
+    } catch {
+      resolve(false)
+      return
+    }
+    socket.setTimeout(Math.max(200, timeoutMs), () => done(false))
+    socket.once('connect', () => done(true))
+    socket.once('error', () => done(false))
+  })
+}
+
 /** 轮询 /api/tags 直到可用或超时。 */
 async function waitForTags(cfg, timeoutMs) {
   const deadline = Date.now() + Math.max(2000, timeoutMs)
@@ -768,11 +799,23 @@ async function waitForTags(cfg, timeoutMs) {
 /** 拉起 Ollama（优先托盘应用，带图标），并等端口可用。 */
 async function startOllama(state, cfg) {
   if (state.ollamaStarting) return state.ollamaStarting
-  // 节流：上一次拉起失败后 30 秒内不再重复 spawn，避免「反复拉起」烦人
+  // 端口已在监听：说明有服务在跑，绝不拉起第二个实例
+  // （以前会在 headless serve 占着端口时再拉托盘应用，托盘应用抢不到端口就每秒重试 → cmd 窗口狂闪）
+  if (await portOpen(cfg)) {
+    state.log('info', 'Ollama 端口已在监听，不再拉起新实例')
+    return waitForTags(cfg, 5000)
+  }
+  // 节流：刚才已经尝试拉起过（无论是 app 还是 serve），120 秒内不要再拉，避免多个实例互相踩
+  if (Date.now() - state.ollamaLaunchAt < 120000) {
+    state.log('warn', '最近已尝试拉起过 Ollama，120 秒内不重复拉起')
+    return false
+  }
+  // 节流：上一次拉起失败后 30 秒内不再重复 spawn
   if (state.ollamaLastStartFailed && Date.now() - state.ollamaLastStartAt < 30000) {
     state.log('warn', 'Ollama 上次启动失败，30 秒内不再重复拉起')
     return false
   }
+  state.ollamaLaunchAt = Date.now()
   state.ollamaLastStartAt = Date.now()
   state.ollamaLastStartFailed = false
   state.ollamaStarting = (async () => {
@@ -783,7 +826,9 @@ async function startOllama(state, cfg) {
       throw new TranslateError('OLLAMA_NOT_FOUND', '找不到 ollama.exe：请先安装 Ollama，或在配置里设置 ollamaExe')
     }
     if (app) {
-      // 托盘应用带图标；用 explorer 拉起，避免 DSH 以管理员运行时把 Ollama 也提权
+      // 托盘应用带图标；用 explorer 拉起，避免 DSH 以管理员运行时把 Ollama 也提权。
+      // 注意：托盘应用自己就是 supervisor（会去起 ollama serve），这里不能再并发起 serve，
+      // 否则两个 supervisor 抢同一个端口 → 托盘应用会每秒重试、cmd 窗口狂闪。
       state.log('info', `自动启动 Ollama 托盘应用：${app}`)
       try {
         const explorer = process.env.SystemRoot
@@ -794,21 +839,17 @@ async function startOllama(state, cfg) {
       } catch (error) {
         state.log('warn', `托盘应用启动失败：${error?.message || error}`)
       }
-      if (await waitForTags(cfg, Math.min(timeout, 12000))) {
-        state.ollamaLastStartFailed = false
-        state.log('info', 'Ollama 已启动（托盘应用）')
-        return true
-      }
-      state.log('warn', '托盘应用没带起服务，兜底启动 ollama serve')
+      const ok = await waitForTags(cfg, timeout)
+      state.ollamaLastStartFailed = !ok
+      if (ok) state.log('info', 'Ollama 已启动（托盘应用）')
+      return ok
     }
-    if (exe) {
-      state.log('info', `自动启动 Ollama 服务：${exe} serve`)
-      try {
-        const child = spawn(exe, ['serve'], { detached: true, stdio: 'ignore', windowsHide: true })
-        if (typeof child.unref === 'function') child.unref()
-      } catch (error) {
-        throw new TranslateError('OLLAMA_START_FAILED', `启动 Ollama 失败：${error?.message || error}`)
-      }
+    state.log('info', `自动启动 Ollama 服务：${exe} serve`)
+    try {
+      const child = spawn(exe, ['serve'], { detached: true, stdio: 'ignore', windowsHide: true })
+      if (typeof child.unref === 'function') child.unref()
+    } catch (error) {
+      throw new TranslateError('OLLAMA_START_FAILED', `启动 Ollama 失败：${error?.message || error}`)
     }
     const ok = await waitForTags(cfg, timeout)
     state.ollamaLastStartFailed = !ok
@@ -827,6 +868,11 @@ async function ensureOllama(state, cfg, signal) {
     return true
   } catch {
     /* 连不上 */
+  }
+  // 端口通但接口没回：服务正在忙（比如加载模型），千万别再拉起一个实例
+  if (await portOpen(cfg)) {
+    state.log('info', 'Ollama 端口已占用但接口未就绪（可能正在加载模型），不再重复拉起')
+    return true
   }
   if (!cfg.autoStartOllama) return false
   try {
@@ -1029,6 +1075,8 @@ function createState(cfg, ctx) {
     ollamaStarting: null,
     ollamaLastStartAt: 0,
     ollamaLastStartFailed: false,
+    /** 最近一次「尝试拉起」的时间，用来避免重复拉起多个实例（关键：端口被占时托盘应用会无限重试 -> cmd 窗口闪）。 */
+    ollamaLaunchAt: 0,
     inflight: new Set(),
     lastError: null,
     disposed: false,
@@ -1436,6 +1484,12 @@ async function handleAction(state, body, signal) {
   // 用户点「启动 Ollama」/页面发现连不上时调用：拉起服务并等它就绪
   if (action === 'startOllama') {
     const cfg = applyOverrides(state, body)
+    // 已经能连上 / 端口已被占用：直接返回，不再拉起任何东西
+    if (await portOpen(cfg)) {
+      const ok = await waitForTags(cfg, 5000)
+      const status = await statusOf(state, signal, cfg)
+      return { ok: status.reachable, started: false, error: ok ? null : '端口已开但接口未就绪', status }
+    }
     let started = false
     let error = null
     try {

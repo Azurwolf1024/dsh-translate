@@ -152,8 +152,8 @@ dsh plugin --profile web add dsh-translate
 - id: dsh-translate
   config:
     model: 'qwen3.5:4b-chat'      # 换了模型就填这里
-    keepAlive: '0'                # 每次翻完立即卸载（最省内存，代价是每次冷加载）
-    idleUnloadMs: 60000           # 空闲 60 秒主动卸载
+    keepAlive: '2h'               # 模型驻留时长（默认 2 小时；'0' = 每次翻完卸载，最省内存但每次冷加载）
+    idleUnloadMs: 0               # 0 = 不主动卸载（避免每次重载让 Ollama 启动子进程、闪控制台）
     defaultTarget: 'zh-Hans'      # 不填 auto = 中↔英自动
 ```
 
@@ -161,8 +161,8 @@ dsh plugin --profile web add dsh-translate
 |---|---|---|
 | `baseURL` | `http://127.0.0.1:11434` | Ollama 端点 |
 | `model` | `kaelri/hy-mt2:1.8b` | 翻译模型（设置页可临时切换） |
-| `keepAlive` | `5m` | 生成后驻留时长；`0` = 立即卸载 |
-| `idleUnloadMs` | `90000` | 空闲多久主动卸载；`0` = 关闭 |
+| `keepAlive` | `2h` | 生成后模型驻留时长；`0` = 立即卸载 |
+| `idleUnloadMs` | `0` | 空闲多久主动卸载模型；`0` = 不卸载（避免每次重载让 Ollama 闪控制台） |
 | `timeoutMs` | `120000` | 单次 Ollama 请求超时 |
 | `maxTextChars` | `20000` | 单次翻译文本上限 |
 | `chunkChars` | `1200` | 分段长度 |
@@ -170,7 +170,7 @@ dsh plugin --profile web add dsh-translate
 | `maxPdfBytes` | `62914560` | PDF 原文件上限（60 MB） |
 | `pdfFont` | `''` | 生成 PDF 用的中文字体路径（留空自动找系统字体） |
 | `clipboardFallback` | `true` | 剪贴板层是否允许「注入一次 Ctrl+C」；`false` = 只被动读，绝不注入 |
-| `autoStartOllama` | `true` | 连不上 Ollama 时自动 `ollama serve` 并等待就绪 |
+| `autoStartOllama` | `true` | 连不上 Ollama 时自动拉起并等待就绪（优先托盘应用，端口被占时不会重复拉起） |
 | `ollamaExe` | `''` | 指定 ollama.exe 路径（留空自动找 PATH / 常见安装目录） |
 | `ollamaStartTimeoutMs` | `25000` | 等待 Ollama 启动完成的上限 |
 | `ollamaLaunch` | `auto` | 自动启动方式：`auto`=优先托盘应用（带图标）、`app`、`serve`（纯后台） |
