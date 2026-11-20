@@ -1,0 +1,83 @@
+{
+  "format": 1,
+  "title": {
+    "en": "dsh-translate plugin source",
+    "zh": "dsh-translate 插件源"
+  },
+  "description": {
+    "en": "Installable DSH bundles maintained by Azurwolf1024. Currently: local-Ollama translation with system-wide selection and PDF support.",
+    "zh": "Azurwolf1024 维护的 DSH 插件源。目前收录：本地 Ollama 翻译插件（任意应用划译 + 文件/PDF 双语排版）。"
+  },
+  "metadata": {
+    "categories": {
+      "translation": {
+        "title": {
+          "en": "Translation",
+          "zh": "翻译"
+        }
+      }
+    },
+    "labels": {
+      "ollama": {
+        "title": {
+          "en": "Ollama",
+          "zh": "Ollama"
+        }
+      },
+      "offline": {
+        "title": {
+          "en": "Offline",
+          "zh": "离线"
+        }
+      }
+    }
+  },
+  "plugins": [
+    {
+      "name": "dsh-translate",
+      "title": {
+        "en": "Local Ollama Translator",
+        "zh": "本地 Ollama 翻译"
+      },
+      "description": {
+        "en": "Translate inside DeepSeek Harness with a local Ollama model: in-page selection popup, system-wide selection (UIA to clipboard to OCR fallback), text/file/PDF translation, automatic Ollama start.",
+        "zh": "在 DeepSeek Harness 里用本地 Ollama 模型翻译：页内划译浮层、任意应用划译（UIA→剪贴板→OCR 回退）、文本/文件/PDF 双语排版，自动拉起 Ollama。"
+      },
+      "icon": "https://raw.githubusercontent.com/Azurwolf1024/dsh-translate/main/icon.svg",
+      "author": "Azurwolf1024",
+      "homepage": "https://github.com/Azurwolf1024/dsh-translate#readme",
+      "repository": {
+        "url": "https://github.com/Azurwolf1024/dsh-translate"
+      },
+      "metadata": {
+        "category": "translation",
+        "keywords": [
+          "translation",
+          "ollama",
+          "offline",
+          "pdf",
+          "ocr",
+          "selection"
+        ],
+        "labels": [
+          "ollama",
+          "offline"
+        ]
+      },
+      "versions": [
+        {
+          "version": "1.7.3",
+          "publishTimestamp": 1794982101,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/Azurwolf1024/dsh-translate",
+            "commit": "747641472b300ce91594dd7663bfaf2bbf99acc0"
+          },
+          "engines": {
+            "dsh": ">=0.2.0-0 <0.3.0-0"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -72,14 +72,43 @@ dsh plugin --profile web add ./dsh-translate
 # 装完按提示重启 / 刷新
 ```
 
-### 方式 C：npm（若已发布）
+### 方式 C：插件市场（推荐分享给别人）
+
+本仓库自带一个 **DSH 插件市场索引**（格式 1，已用官方校验器验证）：
+[`market/index.json`](market/index.json)。
+
+1. 先装「插件市场」浏览界面（官方实验性 bundle，装完重启/刷新）：
+   ```bash
+   dsh plugin add @deepseek-ai/dsh-experimental-plugin-market-bundle
+   ```
+2. **设置 → 插件 → Discover → 索引**，添加：
+   ```
+   https://raw.githubusercontent.com/Azurwolf1024/dsh-translate/main/market/index.json
+   ```
+3. 搜索「本地 Ollama 翻译 / Local Ollama Translator」→ 安装 → 刷新页面。
+
+市场条目用 **Git commit 锁定**（不依赖 npm），安装 spec 形如：
+`git+https://github.com/Azurwolf1024/dsh-translate.git#<40位commit>`。
+
+### 方式 D：直接从 Git commit 装（可复现）
 
 ```bash
-dsh plugin --profile web add dsh-translate
+dsh plugin add "git+https://github.com/Azurwolf1024/dsh-translate.git#747641472b300ce91594dd7663bfaf2bbf99acc0"
 ```
+
+### 方式 E：npm（可选，需自行发布）
+
+> npm 上的 `dsh-translate` 已被别人占用（PerryLink 的整页翻译插件），所以本插件**不发布**这个无 scope 名。
+> 若要发 npm，请改用唯一名（如 `@<你的npm用户名>/dsh-translate`），步骤见
+> [`docs/PUBLISHING.md`](docs/PUBLISHING.md)。
 
 > 本包**没有构建步骤**：`index.js` / `client.js` 就是最终产物，`helper/` 是伴生进程脚本，
 > 所以从 git 源安装不需要 `pnpm build`。
+
+### 发布/分发完整指南
+
+见 [`docs/PUBLISHING.md`](docs/PUBLISHING.md)：插件市场索引格式（字段、语言 id 必须小写、commit 锁定、
+icon 规则）、每次发版后如何更新索引、npm 发布清单、以及「官方 catalog 目前没有第三方入口」的说明。
 
 ## 首次使用（3 步）
 

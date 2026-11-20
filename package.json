@@ -70,7 +70,8 @@
     "test:live": "node tests/selftest.mjs --live",
     "selftest:helper": "powershell -NoProfile -STA -ExecutionPolicy Bypass -File helper/dsh-translate-capture.ps1 -SelfTest",
     "selftest:ocr": "powershell -NoProfile -STA -ExecutionPolicy Bypass -File helper/dsh-translate-capture.ps1 -TestOcr",
-    "selftest:overlay": "powershell -NoProfile -STA -ExecutionPolicy Bypass -File helper/dsh-translate-capture.ps1 -TestOverlay"
+    "selftest:overlay": "powershell -NoProfile -STA -ExecutionPolicy Bypass -File helper/dsh-translate-capture.ps1 -TestOverlay",
+    "test:market": "node tests/market_validate.mjs"
   },
   "dependencies": {
     "pdfjs-dist": "^4.10.38",
@@ -78,6 +79,7 @@
     "@pdf-lib/fontkit": "^1.1.1"
   },
   "devDependencies": {
-    "@napi-rs/canvas": "^0.1.65"
+    "@napi-rs/canvas": "^0.1.65",
+    "@deepseek-ai/dsh-plugin-market-index": "0.2.1-alpha.4"
   }
 }
