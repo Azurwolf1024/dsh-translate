@@ -101,7 +101,13 @@ dsh plugin add "git+https://github.com/Azurwolf1024/dsh-translate.git#747641472b
 
 ---
 
-## 3. npm 发布（已执行：`@azurwolf1024/dsh-translate`）
+## 3. npm 发布（已完成：`@azurwolf1024/dsh-translate@1.7.4`）
+
+- 包页：https://www.npmjs.com/package/@azurwolf1024/dsh-translate
+- 安装：`dsh plugin add @azurwolf1024/dsh-translate`
+- 首次发布注意：新账号/新包的第一次 `npm publish` 会先显示 `0.0.0-stage` 占位版本，
+  registry 的 package 根文档短暂 404（约 1–5 分钟，`npm view ... --prefer-online` 可绕过缓存）；
+  处理完成后正常。占位版本建议 `npm deprecate <name>@0.0.0-stage "placeholder"`，防止被按名安装。
 
 当前没有 npm 凭据，且无 scope 的 `dsh-translate` 已被占用。要走 npm 的话：
 

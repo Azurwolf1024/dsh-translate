@@ -5,8 +5,11 @@
 ## 1.7.4 — 发布到 npm（scoped 包名）
 
 - 包名改为 **`@azurwolf1024/dsh-translate`**（无 scope 的 `dsh-translate` 已被 PerryLink 的插件占用）。
-- 新增 `publishConfig.access = public`，可通过 npm 分发：
+- 新增 `publishConfig.access = public`，**已发布到 npmjs.com**：
   `dsh plugin add @azurwolf1024/dsh-translate`
+  - https://www.npmjs.com/package/@azurwolf1024/dsh-translate
+  - 首次发布时 npm 会短暂只显示 `0.0.0-stage` 占位版本（处理约 5 分钟），之后正常；
+    该占位版本已 `npm deprecate`，避免被误装。
 - 插件市场索引 `market/index.json` 增加该版本的 npm 源条目（1.7.3 的 git 源保留，可回退）。
 - 运行时代码与 1.7.3 相同（helper 版本号同步为 1.7.4）。
 

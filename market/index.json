@@ -66,6 +66,17 @@
       },
       "versions": [
         {
+          "version": "1.7.4",
+          "publishTimestamp": 1795274500,
+          "source": {
+            "type": "npm",
+            "registry": "https://registry.npmjs.org"
+          },
+          "engines": {
+            "dsh": ">=0.2.0-0 <0.3.0-0"
+          }
+        },
+        {
           "version": "1.7.3",
           "publishTimestamp": 1794982101,
           "source": {
