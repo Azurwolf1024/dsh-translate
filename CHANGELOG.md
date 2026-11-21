@@ -2,6 +2,14 @@
 
 本项目从「个人可用的翻译插件」演进到「可分享安装」的过程记录。版本号与 `package.json` 同步。
 
+## 1.7.5 — 修「改名后插件栏/侧栏图标消失」
+
+- 根因：包名改成 `@azurwolf1024/dsh-translate` 后，两个地方仍写旧名 `dsh-translate`：
+  1. `client.js` 的 `window.__ModuleLoader__.load({ id })` —— DSH 用 **package.json 的 name** 标识浏览器模块，
+     id 不一致时客户端半边不会挂载（侧栏图标因此消失；Host 半边其实还活着）；
+  2. `cordis.patch.yml` 的 `name:` —— 必须是真实包名，否则从 npm 安装（node_modules 里是 scoped 目录）时 Host 行解析不到模块。
+- 两处都改为 `@azurwolf1024/dsh-translate`，helper 版本同步 1.7.5。
+
 ## 1.7.4 — 发布到 npm（scoped 包名）
 
 - 包名改为 **`@azurwolf1024/dsh-translate`**（无 scope 的 `dsh-translate` 已被 PerryLink 的插件占用）。

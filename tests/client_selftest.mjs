@@ -113,7 +113,8 @@ vm.runInContext(bundle, context, { filename: 'client.js' })
 
 console.log('\n1. 加载器契约')
 check('bundle 登记了一个 factory', !!windowStub.__definition && typeof windowStub.__definition.factory === 'function')
-check('id 与包名一致', windowStub.__definition?.id === 'dsh-translate', String(windowStub.__definition?.id))
+const pkgName = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).name
+check('id 与包名一致（DSH 用 manifest 包名标识浏览器模块）', windowStub.__definition?.id === pkgName, `${windowStub.__definition?.id} vs ${pkgName}`)
 
 const exportsObject = windowStub.__definition.factory((name) => {
   if (name === 'react') return React

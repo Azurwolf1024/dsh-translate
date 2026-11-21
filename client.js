@@ -18,7 +18,8 @@
  *   - 宿主配置只读（模型/keepAlive 随请求下发，空闲卸载时长由 cordis.patch.yml 决定）。
  */
 window.__ModuleLoader__.load({
-	id: 'dsh-translate',
+	// DSH 用 package.json 的 name 作为浏览器模块 id；改名后这里必须同步，否则客户端半边不会挂载
+	id: '@azurwolf1024/dsh-translate',
 	factory: function (require) {
 		var React = require('react');
 		var h = React.createElement;

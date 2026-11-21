@@ -7,7 +7,7 @@
 # 单次会话内的偏好（存 localStorage），不会写回本文件。
 - insert:
     - id: dsh-translate
-      name: 'dsh-translate'
+      name: '@azurwolf1024/dsh-translate'
       config:
         # 本地 Ollama 端点；该进程只监听回环地址，翻译请求不离开本机。
         baseURL: 'http://127.0.0.1:11434'
