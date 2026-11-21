@@ -19,8 +19,8 @@
 | E. 进官方 catalog | Settings→插件 直接出现 | 需 DeepSeek 官方收录 | — | 目前无公开入口 |
 
 > 注意：npm 上的 **`dsh-translate` 已被别人占用**（PerryLink 的「整页网页翻译」插件，0.3.6）。
-> 所以本插件**不能**用这个无 scope 名字发布 npm；市场条目目前用 **Git 源**（commit 锁定），
-> 这是当前最省事、无需 npm 账号的方案。
+> 本插件因此使用 scoped 名 **`@azurwolf1024/dsh-translate`** 发布（`publishConfig.access = public`）；
+> 市场索引同时保留 npm 源（1.7.4+）与 Git 源（1.7.3，commit 锁定）两条可安装路径。
 
 ---
 
@@ -101,7 +101,7 @@ dsh plugin add "git+https://github.com/Azurwolf1024/dsh-translate.git#747641472b
 
 ---
 
-## 3. npm 发布（可选，需要 npm 账号）
+## 3. npm 发布（已执行：`@azurwolf1024/dsh-translate`）
 
 当前没有 npm 凭据，且无 scope 的 `dsh-translate` 已被占用。要走 npm 的话：
 

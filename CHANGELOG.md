@@ -2,6 +2,14 @@
 
 本项目从「个人可用的翻译插件」演进到「可分享安装」的过程记录。版本号与 `package.json` 同步。
 
+## 1.7.4 — 发布到 npm（scoped 包名）
+
+- 包名改为 **`@azurwolf1024/dsh-translate`**（无 scope 的 `dsh-translate` 已被 PerryLink 的插件占用）。
+- 新增 `publishConfig.access = public`，可通过 npm 分发：
+  `dsh plugin add @azurwolf1024/dsh-translate`
+- 插件市场索引 `market/index.json` 增加该版本的 npm 源条目（1.7.3 的 git 源保留，可回退）。
+- 运行时代码与 1.7.3 相同（helper 版本号同步为 1.7.4）。
+
 ## 1.7.3 — 修「划译时闪过几个 cmd 窗口」
 
 - **根因一（我们引入的）**：曾有多个 Ollama 监督进程抢同一端口——headless `ollama serve` 占着 11434，

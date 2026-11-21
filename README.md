@@ -96,11 +96,14 @@ dsh plugin --profile web add ./dsh-translate
 dsh plugin add "git+https://github.com/Azurwolf1024/dsh-translate.git#747641472b300ce91594dd7663bfaf2bbf99acc0"
 ```
 
-### 方式 E：npm（可选，需自行发布）
+### 方式 E：npm（已发布）
 
-> npm 上的 `dsh-translate` 已被别人占用（PerryLink 的整页翻译插件），所以本插件**不发布**这个无 scope 名。
-> 若要发 npm，请改用唯一名（如 `@<你的npm用户名>/dsh-translate`），步骤见
-> [`docs/PUBLISHING.md`](docs/PUBLISHING.md)。
+```bash
+dsh plugin add @azurwolf1024/dsh-translate
+```
+
+> npm 上无 scope 的 `dsh-translate` 已被别人占用（PerryLink 的整页翻译插件），
+> 所以本插件用 scoped 名 **`@azurwolf1024/dsh-translate`** 发布。
 
 > 本包**没有构建步骤**：`index.js` / `client.js` 就是最终产物，`helper/` 是伴生进程脚本，
 > 所以从 git 源安装不需要 `pnpm build`。

@@ -34,7 +34,7 @@
   },
   "plugins": [
     {
-      "name": "dsh-translate",
+      "name": "@azurwolf1024/dsh-translate",
       "title": {
         "en": "Local Ollama Translator",
         "zh": "本地 Ollama 翻译"

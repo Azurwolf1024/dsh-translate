@@ -1,6 +1,6 @@
 {
-  "name": "dsh-translate",
-  "version": "1.7.3",
+  "name": "@azurwolf1024/dsh-translate",
+  "version": "1.7.4",
   "description": "Translate with a local Ollama model inside DeepSeek Harness: in-page selection popup, system-wide selection (UI Automation -> clipboard -> OCR fallback), text and file translation. Stateless requests, unloads the model when idle.",
   "type": "module",
   "main": "./index.js",
@@ -81,5 +81,8 @@
   "devDependencies": {
     "@napi-rs/canvas": "^0.1.65",
     "@deepseek-ai/dsh-plugin-market-index": "0.2.1-alpha.4"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
