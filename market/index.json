@@ -66,11 +66,12 @@
       },
       "versions": [
         {
-          "version": "1.7.4",
-          "publishTimestamp": 1795274500,
+          "version": "1.7.5",
+          "publishTimestamp": 1795312200,
           "source": {
-            "type": "npm",
-            "registry": "https://registry.npmjs.org"
+            "type": "git",
+            "url": "https://github.com/Azurwolf1024/dsh-translate",
+            "commit": "93a4bf71ddea7862f836adc56b368fa122692db1"
           },
           "engines": {
             "dsh": ">=0.2.0-0 <0.3.0-0"
